@@ -1,0 +1,18 @@
+# Ignore files by default; explicitly allow source, configuration, docs, and reports.
+*
+!*/
+!*.py
+!*.yaml
+!*.yml
+!*.html
+!*.md
+!requirements.txt
+!.gitignore
+
+# Generated data, environments, and caches are never uploaded.
+/data/
+/results/
+/venv/
+/.venv/
+/__pycache__/
+**/__pycache__/

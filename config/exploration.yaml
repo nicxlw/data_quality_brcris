@@ -1,0 +1,63 @@
+# Colunas usadas para gráficos de distribuição categórica no relatório exploratório.
+# O relatório sempre calcula preenchimento/distintos de TODAS as colunas da classe.
+# Valores separados por '|' são divididos individualmente para a distribuição categórica.
+datasets:
+  person:
+    categorical_columns:
+      - gender
+      - nationality
+      - birthCountry
+      - birthState
+      - birthCity
+      - researchArea
+  orgunit:
+    categorical_columns:
+      - type
+      - juridicNature
+      - country
+      - state
+  journal:
+    categorical_columns:
+      - countryCode
+      - type
+      - isOa
+      - isInDoaj
+      - assessmentArea
+      - qualis
+      - keywords
+  program:
+    categorical_columns:
+      - researchArea.capes
+      - researchArea.cnpq
+      - evaluationArea
+  course:
+    categorical_columns:
+      - degree
+      - type
+  patent:
+    categorical_columns:
+      - countryCode
+      - kindCode
+      - classification.ipc.section
+      - classification.ipc.class
+      - classification.cpc.text
+  software:
+    categorical_columns:
+      - language
+      - registrationCountry
+      - kind
+      - environment
+      - availability
+      - platform
+      - knowledgeAreas
+      - activitySector
+      - registrationInstitution
+  researchgroup:
+    categorical_columns:
+      - status
+      - researchLine
+      - keyword
+      - knowledgeArea
+      - applicationSector
+      - equipment
+      - software
