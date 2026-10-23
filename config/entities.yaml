@@ -152,6 +152,142 @@ patent:
     - "alternateIdentifier.number"
     - "alternateIdentifier.kind"
 
+publication_2025_2026:
+  zip: "data/raw/PublicacaoArtigoLattes2025-2026.zip"
+  source_prefix: "PublicacaoArtigoLattes2025-2026"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: &publication_fields
+    - "identifier.brcris"
+    - "identifier.doi"
+    - "identifier.capes"
+    - "identifier.bdtd"
+    - "identifier.oasisbr"
+    - "identifier.handle"
+    - "identifier.pmcid"
+    - "identifier.isi-number"
+    - "identifier.scp-number"
+    - "identifier.issn"
+    - "identifier.isbn"
+    - "identifier.dark"
+    - "identifier.other"
+    - "type"
+    - "language"
+    - "title"
+    - "subtitle"
+    - "alternativeTitle"
+    - "defenceDay"
+    - "publicationDate"
+    - "degreeDate"
+    - "number"
+    - "volume"
+    - "issue"
+    - "series"
+    - "edition"
+    - "startPage"
+    - "endPage"
+    - "author"
+    - "advisor"
+    - "coadvisor"
+    - "referee"
+    - "researchArea.cnpq"
+    - "researchArea.capes"
+    - "researchArea.other"
+    - "resourceUrl"
+    - "rights"
+    - "license"
+    - "keyword"
+    - "abstract"
+    - "status"
+    - "coverage"
+    - "references"
+    - "accessType"
+    - "eventName"
+
+publication_lattes:
+  zip: "data/raw/PublicacaoArtigoLattes.zip"
+  source_prefix: "PublicacaoArtigoLattes"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_capitulo_livro_2025_2026:
+  zip: "data/raw/PublicacaoCapituloLivroLattes2025-2026.zip"
+  source_prefix: "PublicacaoCapituloLivroLattes2025-2026"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_capitulo_livro:
+  zip: "data/raw/PublicacaoCapituloLivroLattes.zip"
+  source_prefix: "PublicacaoCapituloLivroLattes"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_formacao_2025_2026:
+  zip: "data/raw/PublicacaoFormacaoLattes2025-2026.zip"
+  source_prefix: "PublicacaoFormacaoLattes2025-2026"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_formacao:
+  zip: "data/raw/PublicacaoFormacaoLattes.zip"
+  source_prefix: "PublicacaoFormacaoLattes"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_livro_2025_2026:
+  zip: "data/raw/PublicacaoLivroLattes2025-2026.zip"
+  source_prefix: "PublicacaoLivroLattes2025-2026"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_livro:
+  zip: "data/raw/PublicacaoLivroLattes.zip"
+  source_prefix: "PublicacaoLivroLattes"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_orientacoes_2025_2026:
+  zip: "data/raw/PublicacaoOrientacoesLattes2025-2026.zip"
+  source_prefix: "PublicacaoOrientacoesLattes2025-2026"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_orientacoes:
+  zip: "data/raw/PublicacaoOrientacoesLattes.zip"
+  source_prefix: "PublicacaoOrientacoesLattes"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_doi:
+  zip: "data/raw/PublicationDOI.zip"
+  source_prefix: "PublicationDOI"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_orcid:
+  zip: "data/raw/PublicationORCID.zip"
+  source_prefix: "PublicationORCID"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
+publication_oasis:
+  zip: "data/raw/PublicacaoOASIS.zip"
+  source_prefix: "PublicacaoOASIS"
+  record_type: "Publication"
+  dataset: "publication"
+  fields: *publication_fields
+
 software:
   zip: "data/raw/software.zip"
   source_prefix: "software"
