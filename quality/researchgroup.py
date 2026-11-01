@@ -10,7 +10,6 @@ from quality import common
 ENTITY = "researchgroup"
 MANDATORY_COLUMNS = ["ref", "name", "identifier.brcris", "identifier.dgp"]
 URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
-RELATION_TYPES = ["MemberResearchGroup", "LeaderResearchGroup", "PartnerResearchGroupOrgUnit"]
 CURRENT_YEAR = date.today().year
 
 
@@ -148,60 +147,8 @@ def _build_rules(con, columns: list[str], researchgroups: pd.DataFrame) -> list[
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=URL_REGEX),
             lambda: _non_null_rows(researchgroups, "URL"),
         ))
-
-    rules.extend(_referential_rules(con, columns, researchgroups))
     return rules
 
-
-def _referential_rules(con, columns: list[str], researchgroups: pd.DataFrame) -> list[common.Rule]:
-    problem = None
-    if "ref" not in columns:
-        problem = f"a view {ENTITY!r} não tem a coluna ref"
-    elif not common.view_exists(con, "relation"):
-        problem = "a view relation não existe (extraia as relações antes desta validação)"
-    else:
-        relation_columns = common.get_columns(con, "relation")
-        missing = {"type", "toEntityRef"} - set(relation_columns)
-        if missing:
-            problem = f"a view relation não tem as colunas obrigatórias {sorted(missing)}"
-
-    if problem:
-        message = f"Validação referencial impossível: {problem}."
-        return [
-            _broken_rule(
-                f"RGR-CON-REF-{number:02d}", "consistência", "consistência referencial",
-                f"relation.toEntityRef",
-                f"A relação {relation_type} deve apontar, em toEntityRef, para um researchgroup.ref existente.",
-                message,
-            )
-            for number, relation_type in enumerate(RELATION_TYPES, start=1)
-        ]
-
-    researchgroup_refs = sorted(
-        researchgroups["ref"].map(common.normalize_text).dropna().unique().tolist()
-    )
-    relation_columns = common.get_columns(con, "relation")
-    selected = [column for column in ["type", "fromEntityRef", "toEntityRef", "info", "source"]
-                if column in relation_columns]
-    placeholders = ", ".join("?" for _ in RELATION_TYPES)
-    relations = con.execute(
-        f"SELECT {', '.join(common.quote_ident(column) for column in selected)} "
-        f"FROM \"relation\" WHERE lower(CAST(\"type\" AS VARCHAR)) IN ({placeholders})",
-        [relation_type.lower() for relation_type in RELATION_TYPES],
-    ).fetchdf()
-
-    rules: list[common.Rule] = []
-    for number, relation_type in enumerate(RELATION_TYPES, start=1):
-        subset = relations[relations["type"].astype(str).str.lower() == relation_type.lower()].copy()
-        rules.append(_rule(
-            f"RGR-CON-REF-{number:02d}", "consistência", "consistência referencial",
-            f"relation.{relation_type}.toEntityRef",
-            f"A relação {relation_type} deve ter toEntityRef correspondente a researchgroup.ref.",
-            f"toEntityRef da relação {relation_type} não existe em researchgroup.ref.",
-            gxe.ExpectColumnValuesToBeInSet(column="value", value_set=researchgroup_refs),
-            lambda subset=subset: common.relation_rows(subset, "toEntityRef"),
-        ))
-    return rules
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

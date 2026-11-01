@@ -56,7 +56,9 @@ def _run_explore(entity: str) -> int:
     return 0
 
 
-def _run_validate(entity: str, skip_extract: bool, force_extract: bool, workers: int | None) -> int:
+def _run_validate(entity: str, skip_extract: bool, force_extract: bool, workers: int | None, group: str | None = None) -> int:
+    if group is not None and entity != "publication":
+        raise SystemExit("As opções --unicidade, --completude e --validade estão disponíveis apenas para publication.")
     try:
         module = importlib.import_module(f"quality.{entity}")
     except ModuleNotFoundError as exc:
@@ -77,7 +79,10 @@ def _run_validate(entity: str, skip_extract: bool, force_extract: bool, workers:
         _ensure_relation_view_if_available()
 
     print(f"\n[{entity}] executando as validações configuradas...")
-    scores, errors, metadata = validator()
+    if entity == "publication":
+        scores, errors, metadata = validator(group=group)
+    else:
+        scores, errors, metadata = validator()
     paths = common.save_validation_results(entity, scores, errors, metadata)
     paths.update({f"global_{k}": v for k, v in common.build_global_quality_summary().items()})
     print("\nValidação concluída:")
@@ -106,6 +111,13 @@ def main(argv: list[str] | None = None) -> int:
     validate_parser.add_argument("--skip-extract", action="store_true", help="Validar Parquets/views já existentes")
     validate_parser.add_argument("--force-extract", action="store_true", help="Refazer extração antes de validar")
     validate_parser.add_argument("--workers", type=int, default=None, help="Quantidade de workers na extração")
+    group_options = validate_parser.add_mutually_exclusive_group()
+    group_options.add_argument("--unicidade", dest="publication_group", action="store_const", const="unicidade",
+                               help="Executar apenas as regras de unicidade de publication")
+    group_options.add_argument("--completude", dest="publication_group", action="store_const", const="completude",
+                               help="Executar apenas as regras de completude de publication")
+    group_options.add_argument("--validade", dest="publication_group", action="store_const", const="validade",
+                               help="Executar apenas as regras de validade de publication")
 
     args = parser.parse_args(argv)
     if args.command == "explore":
@@ -114,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             raise SystemExit(f"Falha na análise exploratória: {type(exc).__name__}: {exc}") from exc
     try:
-        return _run_validate(args.entity, args.skip_extract, args.force_extract, args.workers)
+        return _run_validate(args.entity, args.skip_extract, args.force_extract, args.workers, args.publication_group)
     except Exception as exc:
         raise SystemExit(f"Falha na validação: {type(exc).__name__}: {exc}") from exc
 

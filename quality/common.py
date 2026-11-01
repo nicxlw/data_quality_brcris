@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import html
+import gc
 import json
 import math
 import os
@@ -129,6 +130,7 @@ class Rule:
     reason: str
     expectation: Any
     data: Any
+    batch_data: Any = None
 
 
 def normalize_text(value: Any) -> str | None:
@@ -219,10 +221,19 @@ def run_quality_checks(entity: str, rules: list[Rule], *,
     datasource = context.data_sources.add_pandas(name="brcris_quality")
 
     scores, errors, audits = [], [], []
-    for rule in rules:
+    for rule_index, rule in enumerate(rules, start=1):
+        rule_started = time.perf_counter()
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{entity}] regra {rule_index}/{len(rules)}: {rule.id} — iniciando", flush=True)
         try:
-            frame = rule.data() if callable(rule.data) else rule.data
-            score, rule_errors, audit = run_expectation(datasource, frame, rule, entity=entity)
+            if rule.batch_data is not None:
+                score, rule_errors, audit = run_batched_expectation(
+                    datasource, rule.batch_data(), rule, entity=entity,
+                )
+            else:
+                frame = rule.data() if callable(rule.data) else rule.data
+                score, rule_errors, audit = run_expectation(
+                    datasource, frame, rule, entity=entity,
+                )
         except Exception as exc:
             score = score_record(rule.id, rule.validation, rule.dimension, rule.column,
                                  rule.description, 0, 0,
@@ -233,6 +244,7 @@ def run_quality_checks(entity: str, rules: list[Rule], *,
         scores.append(score)
         errors.extend(rule_errors)
         audits.append(audit)
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{entity}] regra {rule.id} finalizada em {time.perf_counter() - rule_started:.1f}s; avaliados={score.get('evaluated', 0):,}; falhas={score.get('failures', 0):,}; status={score.get('status')}", flush=True)
 
     metadata = {
         "entity": entity,
@@ -246,9 +258,51 @@ def run_quality_checks(entity: str, rules: list[Rule], *,
     return scores, errors, metadata
 
 
-def run_expectation(datasource, dataframe: pd.DataFrame, rule: Rule, *, entity: str
+def run_batched_expectation(datasource, batches, rule: Rule, *, entity: str
+                            ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Valida blocos de uma regra e agrega seus resultados em um único score."""
+    started = time.perf_counter()
+    element_count = 0
+    unexpected_count = 0
+    batch_count = 0
+    errors: list[dict[str, Any]] = []
+
+    for batch_count, dataframe in enumerate(batches, start=1):
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{entity}] {rule.id}: iniciando lote {batch_count:,} ({len(dataframe):,} registros)", flush=True)
+        batch_started = time.perf_counter()
+        score, batch_errors, _ = run_expectation(
+            datasource, dataframe, rule, entity=entity,
+            asset_suffix=f"batch_{batch_count:05d}",
+        )
+        element_count += score["evaluated"]
+        unexpected_count += score["failures"]
+        errors.extend(batch_errors)
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{entity}] {rule.id}: lote {batch_count:,} concluído em {time.perf_counter() - batch_started:.1f}s; acumulado={element_count:,}; falhas={unexpected_count:,}", flush=True)
+        # Solta referências temporárias antes de carregar o próximo bloco.
+        del dataframe, batch_errors, score
+        gc.collect()
+
+    score = score_record(
+        rule.id, rule.validation, rule.dimension, rule.column, rule.description,
+        element_count, unexpected_count, time.perf_counter() - started,
+    )
+    audit = {
+        "rule_id": rule.id,
+        "expectation": type(rule.expectation).__name__,
+        "success": unexpected_count == 0,
+        "element_count": element_count,
+        "unexpected_count": unexpected_count,
+        "result_format": "COMPLETE",
+        "batch_count": batch_count,
+        "batched": True,
+    }
+    return score, errors, audit
+
+
+def run_expectation(datasource, dataframe: pd.DataFrame, rule: Rule, *,
+                    entity: str, asset_suffix: str | None = None
                     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-    """Executa a Expectation de uma regra e recupera todas as linhas que o GX marcou."""
+    """Executa uma Expectation e remove o asset temporário do GX ao terminar."""
     started = time.perf_counter()
     df = dataframe.reset_index(drop=True).copy()
     if "__dq_row_id" not in df.columns:
@@ -256,36 +310,49 @@ def run_expectation(datasource, dataframe: pd.DataFrame, rule: Rule, *, entity: 
     if df["__dq_row_id"].duplicated().any():
         raise ValueError("__dq_row_id precisa ser único.")
 
-    asset_name = re.sub(r"[^A-Za-z0-9_]", "_", f"asset_{entity}_{rule.id}")
-    asset = datasource.add_dataframe_asset(name=asset_name)
-    batch = asset.add_batch_definition_whole_dataframe("all_rows").get_batch(
-        batch_parameters={"dataframe": df}
-    )
-    result = batch.validate(
-        rule.expectation,
-        result_format={
-            "result_format": "COMPLETE",
-            "unexpected_index_column_names": ["__dq_row_id"],
-            "exclude_unexpected_values": True,
-        },
-    )
-    details = result.result or {}
-    total = int(details.get("element_count") or 0)
-    bad_count = int(details.get("unexpected_count") or 0)
-    bad_rows = _unexpected_rows(df, details, bad_count, rule.id)
+    asset_label = f"asset_{entity}_{rule.id}"
+    if asset_suffix:
+        asset_label = f"{asset_label}_{asset_suffix}"
+    asset_name = re.sub(r"[^A-Za-z0-9_]", "_", asset_label)
+    asset = None
+    try:
+        asset = datasource.add_dataframe_asset(name=asset_name)
+        batch = asset.add_batch_definition_whole_dataframe("all_rows").get_batch(
+            batch_parameters={"dataframe": df}
+        )
+        result = batch.validate(
+            rule.expectation,
+            result_format={
+                "result_format": "COMPLETE",
+                "unexpected_index_column_names": ["__dq_row_id"],
+                "exclude_unexpected_values": True,
+            },
+        )
+        details = result.result or {}
+        total = int(details.get("element_count") or 0)
+        bad_count = int(details.get("unexpected_count") or 0)
+        bad_rows = _unexpected_rows(df, details, bad_count, rule.id)
 
-    score = score_record(rule.id, rule.validation, rule.dimension, rule.column,
-                         rule.description, total, bad_count, time.perf_counter() - started)
-    audit = {
-        "rule_id": rule.id,
-        "expectation": type(rule.expectation).__name__,
-        "success": bool(result.success),
-        "element_count": total,
-        "unexpected_count": bad_count,
-        "result_format": "COMPLETE",
-    }
-    errors = [_error_record(rule, entity, row) for row in bad_rows]
-    return score, errors, audit
+        score = score_record(rule.id, rule.validation, rule.dimension, rule.column,
+                             rule.description, total, bad_count, time.perf_counter() - started)
+        audit = {
+            "rule_id": rule.id,
+            "expectation": type(rule.expectation).__name__,
+            "success": bool(result.success),
+            "element_count": total,
+            "unexpected_count": bad_count,
+            "result_format": "COMPLETE",
+        }
+        errors = [_error_record(rule, entity, row) for row in bad_rows]
+        return score, errors, audit
+    finally:
+        # Evita acumular um asset por lote no datasource efêmero do Great Expectations.
+        if asset is not None:
+            try:
+                datasource.delete_asset(name=asset_name)
+            except (AttributeError, KeyError, ValueError):
+                pass
+        gc.collect()
 
 
 def _unexpected_row_ids(details: dict[str, Any]) -> list[Any]:

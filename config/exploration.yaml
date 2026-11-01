@@ -61,3 +61,11 @@ datasets:
       - applicationSector
       - equipment
       - software
+  publication:
+    categorical_columns:
+      - type
+      - language
+      - accessType
+      - status
+      - rights
+      - license

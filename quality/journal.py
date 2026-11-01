@@ -2,15 +2,15 @@
 
 Padrão declarativo: cada regra é um common.Rule com uma Expectation do GX.
 Pandas/SQL apenas selecionam e preparam os dados; a decisão sobre o que é erro
-fica com o Great Expectations. Esta entidade não possui validações relacionais,
-pois a view relation não está disponível para Journal neste momento.
+fica com o Great Expectations.
 """
 from __future__ import annotations
 
 import pandas as pd
+import re
 import great_expectations.expectations as gxe
 
-from quality import common
+from quality import authority, common
 
 ENTITY = "journal"
 
@@ -27,8 +27,6 @@ ISSN_REGEX = r"^[0-9]{4}-[0-9]{3}[0-9Xx]$"
 # URL HTTP(S) com domínio e caminho/query/fragmento opcionais.
 URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
 BOOLEAN_VALUES = {"true", "false"}
-
-
 def _load_journals(con, columns: list[str]) -> pd.DataFrame:
     """Carrega apenas as colunas necessárias às validações de Journal."""
     wanted = [
@@ -79,7 +77,7 @@ def _boolean_rows(journals: pd.DataFrame, column: str) -> pd.DataFrame:
     return rows
 
 
-def _build_rules(columns: list[str], journals: pd.DataFrame) -> list[common.Rule]:
+def _build_rules(con, columns: list[str], journals: pd.DataFrame) -> list[common.Rule]:
     rules: list[common.Rule] = []
     identifier_columns = [c for c in columns if c.startswith("identifier.")]
 
@@ -189,8 +187,23 @@ def _build_rules(columns: list[str], journals: pd.DataFrame) -> list[common.Rule
             gxe.ExpectColumnValuesToBeInSet(column="value", value_set={"journal"}),
             lambda: common.base_rows(journals, "type"),
         ))
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=journals, columns=columns, column="identifier.issn",
+        authority_file="journals2026.json", authority_fields=("code",),
+        rule_id="JOU-AUT-ISSN",
+        description="identifier.issn deve corresponder a um ISSN da lista de periódicos de autoridade.",
+        tokenized=True,
+        transform=lambda value: re.sub(r"^issn::", "", str(value), flags=re.I),
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=journals, columns=columns, column="title",
+        authority_file="journals2026.json", authority_fields=("name",),
+        rule_id="JOU-AUT-TITLE",
+        description="title deve corresponder a um nome da lista de periódicos de autoridade.",
+    )
 
     return rules
+
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:
@@ -198,7 +211,7 @@ def validate() -> tuple[list[dict], list[dict], dict]:
     with common.connect() as con:
         columns = common.get_columns(con, ENTITY)
         journals = _load_journals(con, columns)
-        rules = _build_rules(columns, journals)
+        rules = _build_rules(con, columns, journals)
     return common.run_quality_checks(
         ENTITY, rules, extra_metadata={"record_count": len(journals)},
     )

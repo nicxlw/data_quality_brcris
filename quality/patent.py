@@ -10,9 +10,6 @@ ENTITY = "patent"
 MANDATORY_COLUMNS = ["identifier.espacenet", "title", "inventor"]
 DATE_REGEX = r"^(0[1-9]|[12][0-9]|3[01])/(0[1-9]|1[0-2])/([0-9]{4})$"
 URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
-REFERENTIAL_TYPES = ["Inventor", "Applicant"]
-
-
 def _load_patents(con, columns: list[str]) -> pd.DataFrame:
     wanted = [
         "ref", "source", "identifier.espacenet", "title", "inventor",
@@ -158,60 +155,8 @@ def _build_rules(con, columns: list[str], patents: pd.DataFrame) -> list[common.
             "publicationDate", "publicationDate deve ser posterior a depositDate.",
             "Não foi possível comparar as datas: depositDate e/ou publicationDate ausente.",
         ))
-
-    rules.extend(_referential_rules(con, columns, patents))
     return rules
 
-
-def _referential_rules(con, columns: list[str], patents: pd.DataFrame) -> list[common.Rule]:
-    problem = None
-    if "ref" not in columns:
-        problem = f"a view {ENTITY!r} não tem a coluna ref"
-    elif not common.view_exists(con, "relation"):
-        problem = "a view relation não existe"
-    else:
-        relation_columns = common.get_columns(con, "relation")
-        missing = {"type", "fromEntityRef", "toEntityRef"} - set(relation_columns)
-        if missing:
-            problem = f"a view relation não tem as colunas obrigatórias {sorted(missing)}"
-
-    if problem:
-        message = f"Validação referencial impossível: {problem}."
-        return [
-            _broken_rule(
-                f"PAT-CON-REF-{number:02d}", "consistência", "consistência referencial",
-                "relation.fromEntityRef",
-                f"A relação {relation_type} deve ter fromEntityRef correspondente a patent.ref.",
-                message,
-            )
-            for number, relation_type in enumerate(REFERENTIAL_TYPES, start=1)
-        ]
-
-    patent_refs = sorted(patents["ref"].map(common.normalize_text).dropna().unique().tolist())
-    relation_columns = common.get_columns(con, "relation")
-    selected = [c for c in ["type", "fromEntityRef", "toEntityRef", "info", "source"]
-                if c in relation_columns]
-    placeholders = ", ".join("?" for _ in REFERENTIAL_TYPES)
-    relations = con.execute(
-        f"SELECT {', '.join(common.quote_ident(c) for c in selected)} "
-        f'FROM "relation" WHERE lower(CAST("type" AS VARCHAR)) IN ({placeholders})',
-        [name.lower() for name in REFERENTIAL_TYPES],
-    ).fetchdf()
-
-    rules = []
-    for number, relation_type in enumerate(REFERENTIAL_TYPES, start=1):
-        subset = relations[
-            relations["type"].astype(str).str.lower() == relation_type.lower()
-        ].copy()
-        rules.append(_rule(
-            f"PAT-CON-REF-{number:02d}", "consistência", "consistência referencial",
-            "relation.fromEntityRef",
-            f"A relação {relation_type} deve ter fromEntityRef correspondente a patent.ref.",
-            f"fromEntityRef da relação {relation_type} não existe em patent.ref.",
-            gxe.ExpectColumnValuesToBeInSet(column="value", value_set=patent_refs),
-            lambda subset=subset: common.relation_rows(subset, "fromEntityRef"),
-        ))
-    return rules
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

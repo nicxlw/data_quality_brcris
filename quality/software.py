@@ -5,17 +5,16 @@ from datetime import date
 
 import pandas as pd
 import great_expectations.expectations as gxe
-from quality import common
+from quality import authority, common
 
 ENTITY = "software"
 MANDATORY_COLUMNS = ["ref", "title", "identifier.brcris", "identifier.inpi"]
 URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
-RELATION_TYPES = ["creator"]
 CURRENT_YEAR = date.today().year
 
 
 def _load_software(con, columns: list[str]) -> pd.DataFrame:
-    wanted = ["ref", "source", "title", "identifier.brcris", "identifier.inpi", "releaseYear", "urlINPI"]
+    wanted = ["ref", "source", "title", "identifier.brcris", "identifier.inpi", "releaseYear", "urlINPI", "registrationCountry", "language"]
     wanted += [column for column in columns if column.startswith("identifier.")]
     selected = [column for column in dict.fromkeys(wanted) if column in columns]
     if not selected:
@@ -148,60 +147,22 @@ def _build_rules(con, columns: list[str], software: pd.DataFrame) -> list[common
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=URL_REGEX),
             lambda: _non_null_rows(software, "urlINPI"),
         ))
-
-    rules.extend(_referential_rules(con, columns, software))
-    return rules
-
-
-def _referential_rules(con, columns: list[str], software: pd.DataFrame) -> list[common.Rule]:
-    problem = None
-    if "ref" not in columns:
-        problem = f"a view {ENTITY!r} não tem a coluna ref"
-    elif not common.view_exists(con, "relation"):
-        problem = "a view relation não existe (extraia as relações antes desta validação)"
-    else:
-        relation_columns = common.get_columns(con, "relation")
-        missing = {"type", "fromEntityRef"} - set(relation_columns)
-        if missing:
-            problem = f"a view relation não tem as colunas obrigatórias {sorted(missing)}"
-
-    if problem:
-        message = f"Validação referencial impossível: {problem}."
-        return [
-            _broken_rule(
-                f"SFT-CON-REF-{number:02d}", "consistência", "consistência referencial",
-                f"relation.fromEntityRef",
-                f"A relação {relation_type} deve apontar, em fromEntityRef, para um software.ref existente.",
-                message,
-            )
-            for number, relation_type in enumerate(RELATION_TYPES, start=1)
-        ]
-
-    software_refs = sorted(
-        software["ref"].map(common.normalize_text).dropna().unique().tolist()
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=software, columns=columns, column="registrationCountry",
+        authority_file="country_authority.json", authority_fields=("code", "name"),
+        rule_id="SFT-AUT-REGISTRATION-COUNTRY",
+        description="registrationCountry deve corresponder a um código ou nome de país aceito.",
     )
-    relation_columns = common.get_columns(con, "relation")
-    selected = [column for column in ["type", "fromEntityRef", "info", "source"]
-                if column in relation_columns]
-    placeholders = ", ".join("?" for _ in RELATION_TYPES)
-    relations = con.execute(
-        f"SELECT {', '.join(common.quote_ident(column) for column in selected)} "
-        f"FROM \"relation\" WHERE lower(CAST(\"type\" AS VARCHAR)) IN ({placeholders})",
-        [relation_type.lower() for relation_type in RELATION_TYPES],
-    ).fetchdf()
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=software, columns=columns, column="language",
+        authority_file="language2026.json",
+        authority_fields=("sigla", "name_original", "name_pt", "name_en"),
+        rule_id="SFT-AUT-LANGUAGE",
+        description="language deve corresponder a um código ou nome de idioma aceito.",
+    )
 
-    rules: list[common.Rule] = []
-    for number, relation_type in enumerate(RELATION_TYPES, start=1):
-        subset = relations[relations["type"].astype(str).str.lower() == relation_type.lower()].copy()
-        rules.append(_rule(
-            f"SFT-CON-REF-{number:02d}", "consistência", "consistência referencial",
-            f"relation.{relation_type}.fromEntityRef",
-            f"A relação {relation_type} deve ter fromEntityRef correspondente a software.ref.",
-            f"fromEntityRef da relação {relation_type} não existe em software.ref.",
-            gxe.ExpectColumnValuesToBeInSet(column="value", value_set=software_refs),
-            lambda subset=subset: common.relation_rows(subset, "fromEntityRef"),
-        ))
     return rules
+
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

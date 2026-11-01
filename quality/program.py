@@ -10,9 +10,6 @@ MANDATORY_COLUMNS = ["ref", "name", "identifier.brcris", "identifier.capes"]
 PHONE_REGEX = r"^\([0-9]{2}\) (?:[0-9]{8}|9[0-9]{8})$"
 EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
-REFERENTIAL_SIDES = [("IsProgramOf", "fromEntityRef"), ("OrgUnitProgram", "toEntityRef")]
-
-
 def _load_programs(con, columns: list[str]) -> pd.DataFrame:
     wanted = ["ref", "source", "name", "identifier.brcris", "identifier.capes", "phone", "email", "websiteUrl", "websiteurl"]
     wanted += [c for c in columns if c.startswith("identifier.")]
@@ -85,42 +82,8 @@ def _build_rules(con, columns: list[str], programs: pd.DataFrame) -> list[common
         rules.append(_rule("PRO-VAL-WEBSITE-URL", "validade", "formato", website_column,
             f"{website_column} deve conter uma URL HTTP ou HTTPS.", "O valor não corresponde ao formato básico de URL HTTP(S).",
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=URL_REGEX), lambda: _non_null_rows(programs, website_column)))
-
-    rules.extend(_referential_rules(con, columns, programs))
     return rules
 
-
-def _referential_rules(con, columns: list[str], programs: pd.DataFrame) -> list[common.Rule]:
-    problem = None
-    if "ref" not in columns:
-        problem = f"a view {ENTITY!r} não tem a coluna ref"
-    elif not common.view_exists(con, "relation"):
-        problem = "a view relation não existe (extraia as relações antes desta validação)"
-    else:
-        relation_columns = common.get_columns(con, "relation")
-        missing = {"type", "fromEntityRef", "toEntityRef"} - set(relation_columns)
-        if missing:
-            problem = f"a view relation não tem as colunas obrigatórias {sorted(missing)}"
-    if problem:
-        message = f"Validação referencial impossível: {problem}."
-        return [_broken_rule(f"PRO-CON-REF-{n:02d}", "consistência", "consistência referencial", f"relation.{side}",
-            f"A relação {kind} deve apontar, em {side}, para um program.ref existente.", message)
-            for n, (kind, side) in enumerate(REFERENTIAL_SIDES, start=1)]
-
-    program_refs = sorted(programs["ref"].map(common.normalize_text).dropna().unique().tolist())
-    relation_columns = common.get_columns(con, "relation")
-    selected = [c for c in ["type", "fromEntityRef", "toEntityRef", "info", "source"] if c in relation_columns]
-    placeholders = ", ".join("?" for _ in REFERENTIAL_SIDES)
-    relations = con.execute(
-        f"SELECT {', '.join(common.quote_ident(c) for c in selected)} FROM \"relation\" WHERE lower(CAST(\"type\" AS VARCHAR)) IN ({placeholders})",
-        [kind.lower() for kind, _ in REFERENTIAL_SIDES]).fetchdf()
-    rules = []
-    for number, (kind, side) in enumerate(REFERENTIAL_SIDES, start=1):
-        subset = relations[relations["type"].astype(str).str.lower() == kind.lower()].copy()
-        rules.append(_rule(f"PRO-CON-REF-{number:02d}", "consistência", "consistência referencial", f"relation.{side}",
-            f"A relação {kind} deve ter {side} correspondente a program.ref.", f"{side} da relação {kind} não existe em program.ref.",
-            gxe.ExpectColumnValuesToBeInSet(column="value", value_set=program_refs), lambda subset=subset, side=side: common.relation_rows(subset, side)))
-    return rules
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

@@ -9,21 +9,13 @@ from __future__ import annotations
 import pandas as pd
 import great_expectations.expectations as gxe
 
-from quality import common
+from quality import authority, common
 
 ENTITY = "person"
 
 # Obrigatoriedade: identifier.brcris não é obrigatório no modelo utilizado.
 MANDATORY_COLUMNS = ["identifier.lattes", "name", "ref"]
-REFERENTIAL_SIDES = [
-    ("Affiliation", "toEntityRef"),
-    ("Inventor", "toEntityRef"),
-    ("Creator", "toEntityRef"),
-    ("LeaderResearchGroup", "fromEntityRef"),
-    ("MemberResearchGroup", "fromEntityRef"),
-]
-
-LATTES_REGEX = r"^[0-9]+$"
+LATTES_REGEX = r"^(?:https?://(?:www\.)?lattes\.cnpq\.br/)?[0-9]{10,16}/?$"
 ORCID_REGEX = r"^[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9Xx]$"
 # Verificação básica: texto sem espaços, um @ e um domínio com ponto.
 EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
@@ -31,7 +23,7 @@ EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 def _load_people(con, columns: list[str]) -> pd.DataFrame:
     """Carrega uma única vez somente as colunas usadas pelas regras de Person."""
-    wanted = ["ref", "source", "name", "email", "identifier.email"] + [
+    wanted = ["ref", "source", "name", "email", "identifier.email", "birthCountry", "birthState", "birthCity"] + [
         c for c in columns if c.startswith("identifier.")
     ]
     selected = [c for c in dict.fromkeys(wanted) if c in columns]
@@ -53,10 +45,12 @@ def _broken_rule(rule_id: str, validation: str, dimension: str, column: str,
 
 
 def _base_rule(rule_id: str, dimension: str, validation: str, column: str,
-               description: str, reason: str, expectation, data) -> common.Rule:
+               description: str, reason: str, expectation, data,
+               batch_data=None) -> common.Rule:
     return common.Rule(
         id=rule_id, dimension=dimension, validation=validation, column=column,
         description=description, reason=reason, expectation=expectation, data=data,
+        batch_data=batch_data,
     )
 
 
@@ -150,8 +144,39 @@ def _build_rules(con, columns: list[str], people: pd.DataFrame) -> list[common.R
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=EMAIL_REGEX),
             lambda column=column: common.split_tokens(people, column),
         ))
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=people, columns=columns, column="birthCountry",
+        authority_file="country_authority.json", authority_fields=("code", "name"),
+        rule_id="PER-AUT-BIRTH-COUNTRY",
+        description="birthCountry deve corresponder a um código ou nome de país aceito.",
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=people, columns=columns, column="birthState",
+        authority_file="state_authority.json", authority_fields=("code", "name"),
+        rule_id="PER-AUT-BIRTH-STATE",
+        description="birthState deve corresponder a um código ou nome de estado aceito.",
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=people, columns=columns, column="birthCity",
+        authority_file="cidades_ibge.csv", authority_fields=("municipio",),
+        rule_id="PER-AUT-BIRTH-CITY",
+        description="birthCity deve corresponder a um município da lista IBGE.",
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=people, columns=columns, column="identifier.lattes",
+        authority_file="ids_lattes2026.csv", authority_fields=("id",),
+        rule_id="PER-AUT-LATTES",
+        description="identifier.lattes deve existir na lista de IDs Lattes de autoridade.",
+        tokenized=True, transform=authority.lattes_id,
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=people, columns=columns, column="identifier.orcid",
+        authority_file="orcid_autoridade2026.csv", authority_fields=("orcid",),
+        rule_id="PER-AUT-ORCID",
+        description="identifier.orcid deve existir na lista de ORCIDs de autoridade.",
+        tokenized=True,
+    )
 
-    rules.extend(_referential_rules(con, columns, people))
     return rules
 
 
@@ -166,53 +191,6 @@ def _tokens_distinct_people(people: pd.DataFrame, column: str) -> pd.DataFrame:
     rows["__dq_row_id"] = range(len(rows))
     return rows
 
-
-def _referential_rules(con, columns: list[str], people: pd.DataFrame) -> list[common.Rule]:
-    """O endpoint de Person em cada tipo de relação deve existir em person.ref."""
-    def description_of(relation_type: str, side: str) -> str:
-        return f"A relação {relation_type} deve apontar, em {side}, para uma pessoa existente em person.ref."
-
-    problem = None
-    relation_columns: list[str] = []
-    if "ref" not in columns:
-        problem = f"a view {ENTITY!r} não tem a coluna ref"
-    elif not common.view_exists(con, "relation"):
-        problem = "a view relation não existe (extraia as relações antes desta validação)"
-    else:
-        relation_columns = common.get_columns(con, "relation")
-        missing = {"type", "fromEntityRef", "toEntityRef"} - set(relation_columns)
-        if missing:
-            problem = f"a view relation não tem as colunas obrigatórias {sorted(missing)}"
-
-    if problem:
-        message = f"Validação referencial impossível: {problem}."
-        return [
-            _broken_rule(f"PER-CON-REF-{number:02d}", "consistência referencial", "consistência",
-                         f"relation.{side}", description_of(relation_type, side), message)
-            for number, (relation_type, side) in enumerate(REFERENTIAL_SIDES, start=1)
-        ]
-
-    person_refs = sorted(people["ref"].map(common.normalize_text).dropna().unique().tolist())
-    selected = [c for c in ["type", "fromEntityRef", "toEntityRef", "info", "source"]
-                if c in relation_columns]
-    placeholders = ", ".join("?" for _ in REFERENTIAL_SIDES)
-    relations = con.execute(
-        f"SELECT {', '.join(common.quote_ident(c) for c in selected)} "
-        f'FROM "relation" WHERE CAST("type" AS VARCHAR) IN ({placeholders})',
-        [relation_type for relation_type, _ in REFERENTIAL_SIDES],
-    ).fetchdf()
-
-    rules = []
-    for number, (relation_type, side) in enumerate(REFERENTIAL_SIDES, start=1):
-        subset = relations[relations["type"] == relation_type]
-        rules.append(_base_rule(
-            f"PER-CON-REF-{number:02d}", "consistência", "consistência referencial",
-            f"relation.{side}", description_of(relation_type, side),
-            f"A referência de Person na relação {relation_type} não existe em person.ref.",
-            gxe.ExpectColumnValuesToBeInSet(column="value", value_set=person_refs),
-            lambda subset=subset, side=side: common.relation_rows(subset, side),
-        ))
-    return rules
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

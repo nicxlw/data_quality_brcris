@@ -49,13 +49,13 @@ STATE_DIR = ROOT / "data" / "extraction_state"
 REJECTS_DIR = ROOT / "data" / "rejects"
 DB_PATH = ROOT / "data" / "tcc.duckdb"
 BATCH_SIZE = 25_000
-EXTRACTOR_FORMAT_VERSION = "relation-info-v1"
+EXTRACTOR_FORMAT_VERSION = "semantic-identifiers-relations-v2"
 
 # Os campos das entidades são configurados exclusivamente em config/entities.yaml.
 # Relações têm estrutura-base fixa e um campo JSON `info` para atributos opcionais
 # específicos de cada tipo de relação. O conteúdo de `info` é JSON válido em texto;
 # quando não houver atributos, o valor é NULL.
-RELATION_COLUMNS = ["type", "fromEntityRef", "toEntityRef", "info"]
+RELATION_COLUMNS = ["type", "fromEntityRef", "toEntityRef", "fromSemanticIdentifier", "toSemanticIdentifier", "info"]
 PORTUGUESE_LANGS = {"POR", "PT", "PT-BR", "PT_BR", "PORTUGUESE"}
 
 
@@ -87,42 +87,93 @@ def load_sources() -> dict[str, dict[str, Any]]:
     return {k: v for k, v in sources.items() if isinstance(v, dict) and "zip" in v}
 
 
+def _configured_entities(source_name: str, raw_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    configured = raw_cfg.get("entities")
+    if configured is None:
+        record_type = raw_cfg.get("record_type") or (raw_cfg.get("record_filter") or {}).get("type")
+        if not record_type and source_name.lower() == "person":
+            record_type = "Person"
+        if not record_type:
+            return []
+        configured = [{
+            "record_type": record_type,
+            "dataset": raw_cfg.get("dataset") or source_name,
+            "fields": raw_cfg.get("fields", []),
+        }]
+    if not isinstance(configured, list):
+        raise SystemExit(
+            f"O campo 'entities' da fonte {source_name!r} deve ser uma lista."
+        )
+
+    entities = []
+    seen_datasets = set()
+    seen_record_types = set()
+    for item in configured:
+        if not isinstance(item, dict):
+            raise SystemExit(
+                f"Cada item de 'entities' na fonte {source_name!r} deve ser um mapa YAML."
+            )
+        record_type = str(item.get("record_type", "")).strip()
+        dataset = str(item.get("dataset", "")).strip()
+        if not record_type or not dataset:
+            raise SystemExit(
+                f"Cada entidade da fonte {source_name!r} precisa de 'record_type' e 'dataset'."
+            )
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", dataset):
+            raise SystemExit(
+                f"Nome de dataset inválido em {CONFIG}: {dataset!r}"
+            )
+        if (dataset == "relation" or dataset in seen_datasets
+                or record_type in seen_record_types):
+            raise SystemExit(
+                f"Dataset ou record_type duplicado/reservado na fonte "
+                f"{source_name!r}: {dataset!r}/{record_type!r}"
+            )
+        seen_datasets.add(dataset)
+        seen_record_types.add(record_type)
+
+        fields = item.get("fields", [])
+        if fields is None:
+            fields = []
+        if isinstance(fields, str) or not isinstance(fields, list):
+            raise SystemExit(
+                f"O campo 'fields' da entidade {record_type!r} na fonte "
+                f"{source_name!r} deve ser uma lista YAML."
+            )
+        entities.append({
+            "record_type": record_type,
+            "dataset": dataset,
+            "columns": list(dict.fromkeys(str(field) for field in fields)),
+        })
+    return entities
+
+
 def load_source(name: str) -> dict[str, Any]:
     sources = load_sources()
-    if name not in sources:
-        available = ", ".join(sources) if sources else "(nenhuma)"
-        raise SystemExit(f"Fonte '{name}' não encontrada em {CONFIG}. Disponíveis: {available}")
-    cfg = dict(sources[name])
+    source_name = name
+    if source_name not in sources:
+        owners = [
+            candidate for candidate, raw_cfg in sources.items()
+            if any(entity["dataset"] == name
+                   for entity in _configured_entities(candidate, raw_cfg))
+        ]
+        if len(owners) == 1:
+            source_name = owners[0]
+        else:
+            available = ", ".join(sources) if sources else "(nenhuma)"
+            raise SystemExit(
+                f"Fonte/dataset '{name}' não encontrado em {CONFIG}. "
+                f"Fontes disponíveis: {available}"
+            )
+    cfg = dict(sources[source_name])
     zip_value = Path(str(cfg["zip"]))
     cfg["zip_path"] = zip_value if zip_value.is_absolute() else ROOT / zip_value
-    cfg["source_prefix"] = str(cfg.get("source_prefix", name)).strip("/\\") or name
-
-    record_type = cfg.get("record_type") or (cfg.get("record_filter") or {}).get("type")
-    if not record_type and name.lower() == "person":
-        record_type = "Person"  # compatibilidade com a configuração antiga
-    # Não há mais lista fechada de record_type. Para um tipo novo, a pessoa
-    # configura record_type e fields no YAML; o extrator descobre campos adicionais
-    # encontrados nos XMLs e os inclui dinamicamente.
-    cfg["record_type"] = record_type
-    cfg["dataset"] = cfg.get("dataset") or (name if record_type else None)
-    if record_type and not cfg["dataset"]:
-        cfg["dataset"] = name
-    if not record_type:
-        cfg["dataset"] = None  # fonte sem tipo de entidade: extrai somente relações
-    if cfg.get("dataset") and not re.fullmatch(r"[A-Za-z0-9_-]+", str(cfg["dataset"])):
-        raise SystemExit(f"Nome de dataset inválido em {CONFIG}: {cfg['dataset']!r}")
-
-    # O YAML é a única fonte de configuração dos campos-base. Não há esquemas
-    # específicos por tipo no Python. Se fields for omitido, a extração ainda
-    # descobre dinamicamente os campos presentes nos XMLs.
-    fields = cfg.get("fields", [])
-    if fields is None:
-        fields = []
-    if isinstance(fields, str) or not isinstance(fields, list):
-        raise SystemExit(
-            f"O campo 'fields' da fonte {name!r} deve ser uma lista YAML de nomes de campos."
-        )
-    cfg["columns"] = list(dict.fromkeys(str(field) for field in fields))
+    cfg["source_name"] = source_name
+    cfg["source_prefix"] = str(cfg.get("source_prefix", source_name)).strip("/\\") or source_name
+    cfg["entities"] = _configured_entities(source_name, cfg)
+    cfg["record_type"] = cfg["entities"][0]["record_type"] if len(cfg["entities"]) == 1 else None
+    cfg["dataset"] = cfg["entities"][0]["dataset"] if len(cfg["entities"]) == 1 else None
+    cfg["columns"] = cfg["entities"][0]["columns"] if len(cfg["entities"]) == 1 else []
     return cfg
 
 
@@ -226,6 +277,20 @@ def relation_info(relation: etree._Element) -> str | None:
     return json.dumps(info, ensure_ascii=False, separators=(",", ":"))
 
 
+def first_semantic_identifier(entity: etree._Element) -> str | None:
+    """Retorna o primeiro semanticIdentifier da entidade, em ordem XML.
+
+    O `ref` é local ao XML; o semanticIdentifier é a chave usada para resolver
+    endpoints entre arquivos e datasets. Não há fallback para `ref`.
+    """
+    for el in entity.iter():
+        if local_name(el.tag) == "semanticIdentifier":
+            value = element_text(el)
+            if value:
+                return value
+    return None
+
+
 def entity_row(entity: etree._Element, record_type: str, columns: list[str], source: str) -> dict[str, Any]:
     """Extrai uma entidade, juntando ocorrências repetidas do mesmo campo com '|'.
 
@@ -279,6 +344,7 @@ def entity_row(entity: etree._Element, record_type: str, columns: list[str], sou
     # ref é o identificador de cluster usado pelas relações fromEntityRef/toEntityRef.
     # source preserva a proveniência: prefixo + caminho interno no ZIP.
     row["ref"] = entity.get("ref")
+    row["semanticIdentifier"] = first_semantic_identifier(entity)
     row["source"] = source
     return row
 
@@ -314,7 +380,8 @@ def schema_for(target: str, columns: list[str]):
     if target == "relation":
         return pa.schema([(c, pa.string()) for c in RELATION_COLUMNS] + [("source", pa.string())])
     # Campos do modelo + metadados para provenance e joins com relation.
-    return pa.schema([(c, pa.string()) for c in columns] + [("ref", pa.string()), ("source", pa.string())])
+    entity_columns = list(dict.fromkeys([*columns, "semanticIdentifier"]))
+    return pa.schema([(c, pa.string()) for c in entity_columns] + [("ref", pa.string()), ("source", pa.string())])
 
 
 def worker_chunk(args: dict[str, Any]) -> dict[str, Any]:
@@ -324,25 +391,25 @@ def worker_chunk(args: dict[str, Any]) -> dict[str, Any]:
     zip_path = args["zip_path"]
     members = args["members"]
     source_prefix = args["source_prefix"]
-    record_type = args.get("record_type")
-    dataset = args.get("dataset")
-    columns = args["columns"]
+    entities = args["entities"]
     max_records = args.get("max_records")
     state_dir = Path(args["state_dir"])
     relation_dir = Path(args["relation_dir"])
-    dataset_dir = Path(args["dataset_dir"]) if args.get("dataset_dir") else None
-    target_dirs: dict[str, Path] = {"relation": relation_dir}
-    if dataset and dataset_dir:
-        target_dirs[dataset] = dataset_dir
+    dataset_dirs = {
+        dataset: Path(path) for dataset, path in args["dataset_dirs"].items()
+    }
+    target_dirs: dict[str, Path] = {"relation": relation_dir, **dataset_dirs}
+    entity_by_type = {entity["record_type"]: entity for entity in entities}
+    columns_by_dataset = {
+        entity["dataset"]: entity["columns"] for entity in entities
+    }
 
     state_file = state_dir / f"worker_{worker_idx:03d}.json"
     config_part = {
         "extractor_format_version": EXTRACTOR_FORMAT_VERSION,
         "source_name": source_name,
         "source_prefix": source_prefix,
-        "record_type": record_type,
-        "dataset": dataset,
-        "columns": columns,
+        "entities": entities,
         "batch_size": BATCH_SIZE,
         "max_records": max_records,
     }
@@ -375,7 +442,12 @@ def worker_chunk(args: dict[str, Any]) -> dict[str, Any]:
     rows: dict[str, list[dict[str, Any]]] = {target: [] for target in target_dirs}
     output_files: dict[str, list[str]] = {target: [] for target in target_dirs}
     part_counts = {target: 0 for target in target_dirs}
-    counts = {"processed_xmls": 0, "entity_rows": 0, "relation_rows": 0}
+    counts = {
+        "processed_xmls": 0,
+        "entity_rows": 0,
+        "entity_rows_by_dataset": {dataset: 0 for dataset in dataset_dirs},
+        "relation_rows": 0,
+    }
     errors: list[dict[str, str]] = []
     started = time.time()
 
@@ -387,6 +459,7 @@ def worker_chunk(args: dict[str, Any]) -> dict[str, Any]:
         if target == "relation":
             schema_columns = []
         else:
+            columns = columns_by_dataset[target]
             # O esquema base garante as colunas esperadas; campos adicionais vistos
             # no lote também viram colunas Parquet (union_by_name=True reúne as partes).
             extra_columns = []
@@ -409,8 +482,12 @@ def worker_chunk(args: dict[str, Any]) -> dict[str, Any]:
     try:
         with zipfile.ZipFile(zip_path) as zf:
             for member_num, member in enumerate(members, start=1):
-                entity_count_in_member = 0
+                entity_count_in_member = {record_type: 0 for record_type in entity_by_type}
                 current_source = source_value(source_prefix, member)
+                # `ref` só é único dentro deste XML. A tabela temporária em memória
+                # resolve endpoints inclusive quando a relação aparece antes da entidade.
+                semantic_by_local_ref: dict[str, str | None] = {}
+                pending_relations: list[dict[str, Any]] = []
                 try:
                     with zf.open(member) as xml_stream:
                         parser = etree.iterparse(
@@ -425,26 +502,45 @@ def worker_chunk(args: dict[str, Any]) -> dict[str, Any]:
                         for _, el in parser:
                             tag = local_name(el.tag)
                             if tag == "entity":
-                                if record_type and el.get("type") == record_type:
-                                    entity_count_in_member += 1
-                                    if max_records is None or entity_count_in_member <= max_records:
-                                        rows[dataset].append(entity_row(el, record_type, columns, current_source))
+                                local_ref = el.get("ref")
+                                if local_ref:
+                                    semantic_by_local_ref[local_ref] = first_semantic_identifier(el)
+                                entity_cfg = entity_by_type.get(el.get("type"))
+                                if entity_cfg is not None:
+                                    dataset = entity_cfg["dataset"]
+                                    record_type = entity_cfg["record_type"]
+                                    entity_count_in_member[record_type] += 1
+                                    if (max_records is None
+                                            or entity_count_in_member[record_type] <= max_records):
+                                        rows[dataset].append(entity_row(
+                                            el, record_type, entity_cfg["columns"], current_source,
+                                        ))
                                         counts["entity_rows"] += 1
+                                        counts["entity_rows_by_dataset"][dataset] += 1
+                                    if len(rows[dataset]) >= BATCH_SIZE:
+                                        flush(dataset)
                             elif tag == "relation":
-                                rows["relation"].append({
+                                pending_relations.append({
                                     "type": el.get("type"),
                                     "fromEntityRef": el.get("fromEntityRef"),
                                     "toEntityRef": el.get("toEntityRef"),
                                     "info": relation_info(el),
-                                    "source": current_source,
                                 })
-                                counts["relation_rows"] += 1
 
                             clear_processed_element(el)
-                            if dataset and len(rows[dataset]) >= BATCH_SIZE:
-                                flush(dataset)
-                            if len(rows["relation"]) >= BATCH_SIZE:
-                                flush("relation")
+                    # Resolver após o XML inteiro: não depende da ordem de entidades/relações.
+                    for relation in pending_relations:
+                        from_ref = relation.get("fromEntityRef")
+                        to_ref = relation.get("toEntityRef")
+                        rows["relation"].append({
+                            **relation,
+                            "fromSemanticIdentifier": semantic_by_local_ref.get(from_ref) if from_ref else None,
+                            "toSemanticIdentifier": semantic_by_local_ref.get(to_ref) if to_ref else None,
+                            "source": current_source,
+                        })
+                        counts["relation_rows"] += 1
+                        if len(rows["relation"]) >= BATCH_SIZE:
+                            flush("relation")
                     counts["processed_xmls"] += 1
                 except Exception as exc:
                     errors.append({"member": member, "error": f"{type(exc).__name__}: {exc}"})
@@ -454,7 +550,7 @@ def worker_chunk(args: dict[str, Any]) -> dict[str, Any]:
                         f"entidades={counts['entity_rows']:,}; relações={counts['relation_rows']:,}",
                         flush=True,
                     )
-        if dataset:
+        for dataset in dataset_dirs:
             flush(dataset)
         flush("relation")
     except Exception:
@@ -468,6 +564,7 @@ def worker_chunk(args: dict[str, Any]) -> dict[str, Any]:
         "processed_xmls": counts["processed_xmls"],
         "member_count": len(members),
         "entity_rows": counts["entity_rows"],
+        "entity_rows_by_dataset": counts["entity_rows_by_dataset"],
         "relation_rows": counts["relation_rows"],
         "errors": errors,
         "output_files": output_files,
@@ -509,21 +606,10 @@ def configured_columns_for_dataset(dataset_name: str) -> list[str]:
     """Reúne fields do YAML para o dataset, sem manter listas duplicadas no Python."""
     columns: list[str] = []
     for source_name, raw_cfg in load_sources().items():
-        record_type = raw_cfg.get("record_type") or (raw_cfg.get("record_filter") or {}).get("type")
-        if not record_type and source_name.lower() == "person":
-            record_type = "Person"  # compatibilidade com a configuração antiga
-        configured_dataset = raw_cfg.get("dataset") or (source_name if record_type else None)
-        if configured_dataset != dataset_name:
-            continue
-        fields = raw_cfg.get("fields", [])
-        if fields is None:
-            fields = []
-        if isinstance(fields, str) or not isinstance(fields, list):
-            raise SystemExit(
-                f"O campo 'fields' da fonte {source_name!r} deve ser uma lista YAML de nomes de campos."
-            )
-        columns.extend(str(field) for field in fields)
-    return list(dict.fromkeys(columns))
+        for entity in _configured_entities(source_name, raw_cfg):
+            if entity["dataset"] == dataset_name:
+                columns.extend(entity["columns"])
+    return list(dict.fromkeys([*columns, "semanticIdentifier"]))
 
 
 def ensure_view(name: str) -> None:
@@ -558,7 +644,8 @@ def inspect_source(name: str) -> None:
         gib = 1024 ** 3
         print(f"Fonte: {name}")
         print(f"ZIP: {zip_path}")
-        print(f"Tipo de entidade: {cfg.get('record_type') or '(somente relações)'}")
+        entity_types = ", ".join(entity["record_type"] for entity in cfg["entities"])
+        print(f"Tipos de entidade: {entity_types or '(somente relações)'}")
         print(f"XMLs válidos: {len(infos):,}")
         print(f"Tamanho compactado: {sum(i.compress_size for i in infos) / gib:.3f} GiB")
         print(f"Tamanho descompactado: {sum(i.file_size for i in infos) / gib:.3f} GiB")
@@ -591,6 +678,7 @@ def extract_source(
 ) -> dict[str, Any]:
     require_extraction_dependencies()
     cfg = load_source(name)
+    name = cfg["source_name"]
     zip_path: Path = cfg["zip_path"]
     if not zip_path.exists():
         raise SystemExit(f"ZIP não encontrado: {zip_path}")
@@ -612,16 +700,20 @@ def extract_source(
 
     source_slug = safe_slug(name)
     source_state_dir = STATE_DIR / source_slug
-    dataset = cfg.get("dataset")
-    columns = cfg["columns"]
-    dataset_dir = PARQUET_DIR / dataset if dataset else None
+    entities = cfg["entities"]
+    dataset_dirs = {
+        entity["dataset"]: PARQUET_DIR / entity["dataset"] for entity in entities
+    }
+    columns_by_dataset = {
+        entity["dataset"]: entity["columns"] for entity in entities
+    }
     relation_dir = PARQUET_DIR / "relation"
     PARQUET_DIR.mkdir(parents=True, exist_ok=True)
     relation_dir.mkdir(parents=True, exist_ok=True)
-    if dataset_dir:
+    for dataset_dir in dataset_dirs.values():
         dataset_dir.mkdir(parents=True, exist_ok=True)
 
-    target_dirs = [relation_dir] + ([dataset_dir] if dataset_dir else [])
+    target_dirs = [relation_dir, *dataset_dirs.values()]
     if force:
         for folder in target_dirs:
             for old_file in folder.glob(f"{source_slug}__p*__part_*.parquet"):
@@ -654,11 +746,11 @@ def extract_source(
             "zip_path": str(zip_path),
             "members": chunk,
             "source_prefix": cfg["source_prefix"],
-            "record_type": cfg.get("record_type"),
-            "dataset": dataset,
-            "columns": columns,
+            "entities": entities,
             "max_records": max_records,
-            "dataset_dir": str(dataset_dir) if dataset_dir else None,
+            "dataset_dirs": {
+                dataset: str(path) for dataset, path in dataset_dirs.items()
+            },
             "relation_dir": str(relation_dir),
             "state_dir": str(source_state_dir),
             "force": force,
@@ -666,7 +758,10 @@ def extract_source(
 
     print(f"Fonte: {name}")
     print(f"ZIP: {zip_path}")
-    print(f"Tipo: {cfg.get('record_type') or '(somente relações)'}; dataset: {dataset or '(nenhum)'}")
+    entity_summary = ", ".join(
+        f"{entity['record_type']} -> {entity['dataset']}" for entity in entities
+    ) or "(somente relações)"
+    print(f"Tipos/datasets: {entity_summary}")
     print(f"XMLs a processar: {len(members):,}; workers: {worker_count}; lote: {BATCH_SIZE:,}")
     if limit_members is not None or max_records is not None:
         print("ATENÇÃO: execução limitada para teste; o resultado NÃO é a extração completa.")
@@ -689,7 +784,7 @@ def extract_source(
 
     # Views sempre incluem todos os Parquets do dataset; relation acumula relações
     # de todas as fontes sem apagar as geradas por outros ZIPs.
-    if dataset:
+    for dataset, columns in columns_by_dataset.items():
         ensure_empty_schema_parquet(dataset, columns)
         ensure_view(dataset)
     ensure_empty_schema_parquet("relation")
@@ -708,12 +803,21 @@ def extract_source(
     processed_xmls = sum(result["processed_xmls"] for result in summaries)
     entity_rows = sum(result["entity_rows"] for result in summaries)
     relation_rows = sum(result["relation_rows"] for result in summaries)
+    entity_rows_by_dataset = {
+        dataset: sum(result["entity_rows_by_dataset"].get(dataset, 0) for result in summaries)
+        for dataset in dataset_dirs
+    }
     summary = {
         "source": name,
         "zip": str(zip_path),
         "source_prefix": cfg["source_prefix"],
-        "record_type_extracted": cfg.get("record_type"),
-        "dataset": dataset,
+        "record_type_extracted": (
+            entities[0]["record_type"] if len(entities) == 1 else None
+        ),
+        "entity_types_extracted": [entity["record_type"] for entity in entities],
+        "datasets": list(dataset_dirs),
+        "entity_rows_by_dataset": entity_rows_by_dataset,
+        "dataset": entities[0]["dataset"] if len(entities) == 1 else None,
         "xml_files_in_run": len(members),
         "xml_files_processed": processed_xmls,
         "entity_rows_written_or_reused": entity_rows,
@@ -731,10 +835,12 @@ def extract_source(
 
     print("\nExtração concluída.")
     print(f"  XMLs processados: {processed_xmls:,}/{len(members):,}")
-    print(f"  Entidades {cfg.get('record_type') or ''}: {entity_rows:,}")
+    print(f"  Entidades extraídas: {entity_rows:,}")
+    for dataset, count in entity_rows_by_dataset.items():
+        print(f"    {dataset}: {count:,}")
     print(f"  Relações encontradas: {relation_rows:,}")
     print(f"  XMLs com erro: {len(all_errors):,}")
-    if dataset_dir:
+    for dataset, dataset_dir in dataset_dirs.items():
         print(f"  Parquet {dataset}: {dataset_dir}")
     print(f"  Parquet relation: {relation_dir}")
     print(f"  DuckDB: {DB_PATH}")

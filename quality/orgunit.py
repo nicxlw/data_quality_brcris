@@ -9,7 +9,7 @@ from __future__ import annotations
 import pandas as pd
 import great_expectations.expectations as gxe
 
-from quality import common
+from quality import authority, common
 
 ENTITY = "orgunit"
 
@@ -25,20 +25,11 @@ URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
 # Endpoint que representa OrgUnit em cada tipo de relação.
 # IsProgramOf foi incluída conforme solicitado; o lado fromEntityRef é a
 # interpretação adotada para a referência de OrgUnit nesta validação.
-REFERENTIAL_SIDES = [
-    ("Affiliation", "fromEntityRef"),
-    ("IsProgramOf", "fromEntityRef"),
-    ("OrgUnitProgram", "fromEntityRef"),
-    ("Applicant", "toEntityRef"),
-    ("PartnerResearchGroupOrgUnit", "fromEntityRef"),
-]
-
-
 def _load_orgunits(con, columns: list[str]) -> pd.DataFrame:
     """Carrega somente as colunas necessárias às regras de OrgUnit."""
     wanted = [
         "ref", "source", "name", "country", "identifier.brcris", "identifier.isni",
-        "identifier.cnpj", "electronicAddress", "websiteUrl", "phone",
+        "identifier.cnpj", "electronicAddress", "websiteUrl", "phone", "state", "city",
     ] + [c for c in columns if c.startswith("identifier.")]
     selected = [c for c in dict.fromkeys(wanted) if c in columns]
     if not selected:
@@ -168,8 +159,33 @@ def _build_rules(con, columns: list[str], orgunits: pd.DataFrame) -> list[common
             if column.startswith("identifier.") or column == "electronicAddress"
             else _non_null_base_rows(orgunits, column),
         ))
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=orgunits, columns=columns, column="country",
+        authority_file="country_authority.json", authority_fields=("code", "name"),
+        rule_id="ORG-AUT-COUNTRY",
+        description="country deve corresponder a um código ou nome de país aceito.",
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=orgunits, columns=columns, column="state",
+        authority_file="state_authority.json", authority_fields=("code", "name"),
+        rule_id="ORG-AUT-STATE",
+        description="state deve corresponder a um código ou nome de estado aceito.",
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=orgunits, columns=columns, column="city",
+        authority_file="cidades_ibge.csv", authority_fields=("municipio",),
+        rule_id="ORG-AUT-CITY-BR",
+        description="Quando country for Brasil, city deve corresponder a um município da lista IBGE.",
+        country_column="country", only_brazil=True,
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=orgunits, columns=columns, column="identifier.brcris",
+        authority_file="orgunit2026.json", authority_fields=("code",),
+        rule_id="ORG-AUT-BRCRIS",
+        description="identifier.brcris deve existir na lista de códigos BrCris de autoridade.",
+        tokenized=True,
+    )
 
-    rules.extend(_referential_rules(con, columns, orgunits))
     return rules
 
 
@@ -201,55 +217,6 @@ def _non_null_base_rows(orgunits: pd.DataFrame, column: str) -> pd.DataFrame:
     rows = common.base_rows(orgunits, column)
     return rows[rows["value"].notna()].reset_index(drop=True)
 
-
-def _referential_rules(con, columns: list[str], orgunits: pd.DataFrame) -> list[common.Rule]:
-    """Verifica se o endpoint configurado de cada relação existe em orgunit.ref."""
-    def description_of(relation_type: str, side: str) -> str:
-        return (f"A relação {relation_type} deve apontar, em {side}, "
-                "para uma organização existente em orgunit.ref.")
-
-    problem = None
-    relation_columns: list[str] = []
-    if "ref" not in columns:
-        problem = f"a view {ENTITY!r} não tem a coluna ref"
-    elif not common.view_exists(con, "relation"):
-        problem = "a view relation não existe (extraia as relações antes desta validação)"
-    else:
-        relation_columns = common.get_columns(con, "relation")
-        missing = {"type", "fromEntityRef", "toEntityRef"} - set(relation_columns)
-        if missing:
-            problem = f"a view relation não tem as colunas obrigatórias {sorted(missing)}"
-
-    if problem:
-        message = f"Validação referencial impossível: {problem}."
-        return [
-            _broken_rule(
-                f"ORG-CON-REF-{number:02d}", "consistência referencial", "consistência",
-                f"relation.{side}", description_of(relation_type, side), message,
-            )
-            for number, (relation_type, side) in enumerate(REFERENTIAL_SIDES, start=1)
-        ]
-
-    orgunit_refs = sorted(orgunits["ref"].map(common.normalize_text).dropna().unique().tolist())
-    selected = [c for c in ["type", "fromEntityRef", "toEntityRef", "info", "source"]
-                if c in relation_columns]
-    relations = con.execute(
-        f"SELECT {', '.join(common.quote_ident(c) for c in selected)} "
-        f'FROM "relation" WHERE lower(CAST("type" AS VARCHAR)) IN ({", ".join("?" for _ in REFERENTIAL_SIDES)})',
-        [relation_type.lower() for relation_type, _ in REFERENTIAL_SIDES],
-    ).fetchdf()
-
-    rules = []
-    for number, (relation_type, side) in enumerate(REFERENTIAL_SIDES, start=1):
-        subset = relations[relations["type"].astype(str).str.lower() == relation_type.lower()].copy()
-        rules.append(_base_rule(
-            f"ORG-CON-REF-{number:02d}", "consistência", "consistência referencial",
-            f"relation.{side}", description_of(relation_type, side),
-            f"A referência de OrgUnit na relação {relation_type} não existe em orgunit.ref.",
-            gxe.ExpectColumnValuesToBeInSet(column="value", value_set=orgunit_refs),
-            lambda subset=subset, side=side: common.relation_rows(subset, side),
-        ))
-    return rules
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:
