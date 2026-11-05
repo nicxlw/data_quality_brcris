@@ -28,6 +28,11 @@ def normalize_authority(value) -> str | None:
 def authority_values(filename: str, fields: tuple[str, ...]) -> frozenset[str]:
     """Carrega e normaliza os valores permitidos; cacheia por arquivo/campos."""
     path = AUTHORITY_DIR / filename
+    if filename == "dominios.json":
+        # listas fechadas: {"nome_da_lista": [valores...]}; `fields` traz o nome da lista
+        data = json.loads(path.read_text(encoding="utf-8"))
+        values = {normalize_authority(v) for v in data[fields[0]]}
+        return frozenset(v for v in values if v is not None)
     if filename.endswith(".json"):
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):

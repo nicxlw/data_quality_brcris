@@ -10,7 +10,7 @@ import pandas as pd
 import re
 import great_expectations.expectations as gxe
 
-from quality import authority, common
+from quality import authority, checks, common
 
 ENTITY = "journal"
 
@@ -24,15 +24,18 @@ MANDATORY_COLUMNS = [
 
 # ISSN tem sete dígitos e um dígito de controle, que também pode ser X.
 ISSN_REGEX = r"^[0-9]{4}-[0-9]{3}[0-9Xx]$"
-# URL HTTP(S) com domínio e caminho/query/fragmento opcionais.
-URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
+# URL: ver common.URL_REGEX (aceita www., linktree e outros endereços sem http).
+URL_REGEX = common.URL_REGEX
 BOOLEAN_VALUES = {"true", "false"}
+CURRENCY_REGEX = r"^[A-Z]{3}$"   # código de moeda ISO 4217 (3 letras maiúsculas)
+
+
 def _load_journals(con, columns: list[str]) -> pd.DataFrame:
     """Carrega apenas as colunas necessárias às validações de Journal."""
     wanted = [
         "ref", "source", "title", "identifier.openalex", "identifier.issn",
         "identifier.issn_l", "identifier.brcris", "websiteURL", "isOa",
-        "isInDoaj", "type",
+        "isInDoaj", "type", "countryCode", "apcCost.apcCurrency", "h_index", "i10_index", "qualis",
     ] + [c for c in columns if c.startswith("identifier.")]
     selected = [c for c in dict.fromkeys(wanted) if c in columns]
     if not selected:
@@ -43,23 +46,8 @@ def _load_journals(con, columns: list[str]) -> pd.DataFrame:
     ).fetchdf()
 
 
-def _broken_rule(rule_id: str, validation: str, dimension: str, column: str,
-                 description: str, problem: str) -> common.Rule:
-    """Representa incompatibilidades de schema como erros técnicos explícitos."""
-    def _raise():
-        raise ValueError(problem)
-    return common.Rule(
-        id=rule_id, dimension=dimension, validation=validation, column=column,
-        description=description, reason=problem, expectation=None, data=_raise,
-    )
-
-
-def _base_rule(rule_id: str, dimension: str, validation: str, column: str,
-               description: str, reason: str, expectation, data) -> common.Rule:
-    return common.Rule(
-        id=rule_id, dimension=dimension, validation=validation, column=column,
-        description=description, reason=reason, expectation=expectation, data=data,
-    )
+_broken_rule = common.make_broken_rule
+_base_rule = common.make_rule
 
 
 def _non_null_base_rows(journals: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -129,7 +117,7 @@ def _build_rules(con, columns: list[str], journals: pd.DataFrame) -> list[common
         ("identifier.issn", "JOU-VAL-ISSN"),
         ("identifier.issn_l", "JOU-VAL-ISSN-L"),
     ]:
-        description = f"{column} deve seguir o formato XXXX-XXXX."
+        description = f"{column} deve seguir o formato XXXX-XXXX (vários ISSN separados por '|' são aceitos; cada um é avaliado)."
         if column not in columns:
             rules.append(_broken_rule(
                 rule_id, "validade", "validade", column, description,
@@ -143,14 +131,36 @@ def _build_rules(con, columns: list[str], journals: pd.DataFrame) -> list[common
             lambda column=column: common.split_tokens(journals, column),
         ))
 
-    # 5. websiteURL deve ser uma URL HTTP(S); valores ausentes são ignorados aqui.
+    # 4b. Dígito verificador do ISSN (só nos valores que já têm o formato XXXX-XXXX).
+    for column, rule_id in [("identifier.issn", "JOU-VAL-ISSN-DV"), ("identifier.issn_l", "JOU-VAL-ISSN-L-DV")]:
+        if column not in columns:
+            continue
+        rules.append(common.make_check_rule(
+            rule_id, "validade", "dígito verificador", column,
+            f"O dígito verificador de {column} deve ser válido (avaliado nos valores com formato XXXX-XXXX).",
+            f"O dígito verificador de {column} não confere.",
+            lambda column=column: _issn_format_ok(journals, column),
+            checks.issn,
+        ))
+
+    # 4c. brcris do periódico é o MD5 do ISSN (um hash por ISSN, na mesma linha).
+    if {"identifier.issn", "identifier.brcris"}.issubset(columns):
+        rules.append(common.make_check_rule(
+            "JOU-CON-BRCRIS-ISSN", "consistência", "consistência entre campos", "identifier.brcris",
+            "identifier.brcris deve ser o MD5 do identifier.issn (um hash por ISSN).",
+            "identifier.brcris não corresponde ao MD5 do identifier.issn do mesmo registro.",
+            lambda: _issn_brcris_pairs(journals),
+            _brcris_matches_issn,
+        ))
+
+    # 5. websiteURL deve ser um endereço web válido; valores ausentes são ignorados aqui.
     if "websiteURL" in columns:
         rules.append(_base_rule(
             "JOU-VAL-WEBSITE-URL", "validade", "formato de URL", "websiteURL",
-            "websiteURL, quando preenchido, deve conter uma URL HTTP(S).",
-            "O valor de websiteURL não corresponde ao formato básico de URL HTTP(S).",
+            "websiteURL, quando preenchido, deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).",
+            "O valor de websiteURL não corresponde ao formato de endereço web (domínio com ponto, sem espaços).",
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=URL_REGEX),
-            lambda: _non_null_base_rows(journals, "websiteURL"),
+            lambda: common.split_tokens(journals, "websiteURL"),
         ))
 
     # 6. isOa e isInDoaj devem ser true ou false (aceita booleanos e strings em qualquer caixa).
@@ -196,14 +206,79 @@ def _build_rules(con, columns: list[str], journals: pd.DataFrame) -> list[common
         transform=lambda value: re.sub(r"^issn::", "", str(value), flags=re.I),
     )
     authority.add_authority_rule(
+        rules, entity=ENTITY, frame=journals, columns=columns, column="countryCode",
+        authority_file="country_authority.json", authority_fields=("code", "name"),
+        rule_id="JOU-AUT-COUNTRY",
+        description="countryCode deve corresponder a um código ou nome de país aceito.",
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=journals, columns=columns, column="qualis",
+        authority_file="dominios.json", authority_fields=("qualis",),
+        rule_id="JOU-AUT-QUALIS",
+        description="qualis deve ser um dos conceitos A1-A4, B1-B4 ou C.",
+    )
+    authority.add_authority_rule(
         rules, entity=ENTITY, frame=journals, columns=columns, column="title",
         authority_file="journals2026.json", authority_fields=("name",),
         rule_id="JOU-AUT-TITLE",
         description="title deve corresponder a um nome da lista de periódicos de autoridade.",
     )
 
+    # 8. Moeda do APC (código de 3 letras) e índices numéricos não negativos.
+    if "apcCost.apcCurrency" in columns:
+        rules.append(_base_rule(
+            "JOU-VAL-APC-CURRENCY", "validade", "formato", "apcCost.apcCurrency",
+            "apcCost.apcCurrency, quando preenchido, deve ser um código de moeda de 3 letras maiúsculas (ex.: USD).",
+            "O valor de apcCost.apcCurrency não é um código de moeda de 3 letras maiúsculas.",
+            gxe.ExpectColumnValuesToMatchRegex(column="value", regex=CURRENCY_REGEX),
+            lambda: _non_null_base_rows(journals, "apcCost.apcCurrency"),
+        ))
+    for column, rule_id in [("h_index", "JOU-VAL-H-INDEX"), ("i10_index", "JOU-VAL-I10-INDEX")]:
+        if column not in columns:
+            continue
+        rules.append(common.make_check_rule(
+            rule_id, "validade", "limite", column,
+            f"{column}, quando preenchido, deve ser um número maior ou igual a zero.",
+            f"O valor de {column} não é um número maior ou igual a zero.",
+            lambda column=column: _non_null_base_rows(journals, column),
+            _non_negative_number,
+        ))
+
     return rules
 
+
+def _issn_format_ok(journals: pd.DataFrame, column: str) -> pd.DataFrame:
+    """ISSN já no formato XXXX-XXXX; só eles passam pela checagem do dígito verificador."""
+    rows = common.split_tokens(journals, column)
+    return rows.loc[rows["value"].str.fullmatch(ISSN_REGEX, na=False)].reset_index(drop=True)
+
+
+def _issn_brcris_pairs(journals: pd.DataFrame) -> pd.DataFrame:
+    """Uma linha por registro com ISSN e brcris preenchidos: value = 'issn / brcris'."""
+    frame = journals[["ref", "source", "identifier.issn", "identifier.brcris"]].copy()
+    issn = frame["identifier.issn"].map(common.normalize_text)
+    brcris = frame["identifier.brcris"].map(common.normalize_text)
+    keep = issn.notna() & brcris.notna()
+    frame = frame.loc[keep].copy()
+    frame["record_value"] = issn[keep] + " / " + brcris[keep]
+    frame["value"] = frame["record_value"]
+    frame = frame[["ref", "source", "record_value", "value"]].reset_index(drop=True)
+    frame.insert(0, "__dq_row_id", range(len(frame)))
+    return frame
+
+
+def _brcris_matches_issn(pair: str) -> bool:
+    issn, _, brcris = pair.partition(" / ")
+    expected = {checks.md5_hex(item.strip()) for item in issn.split("|") if item.strip()}
+    found = {item.strip().lower() for item in brcris.split("|") if item.strip()}
+    return expected == found
+
+
+def _non_negative_number(value) -> bool:
+    try:
+        return float(str(value).replace(",", ".")) >= 0
+    except ValueError:
+        return False
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

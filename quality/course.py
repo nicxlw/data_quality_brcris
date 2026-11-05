@@ -6,7 +6,7 @@ from datetime import date
 import pandas as pd
 import great_expectations.expectations as gxe
 
-from quality import common
+from quality import authority, common
 
 ENTITY = "course"
 MANDATORY_COLUMNS = ["ref", "name", "identifier.brcris", "identifier.capes"]
@@ -15,7 +15,7 @@ CURRENT_YEAR = date.today().year
 
 
 def _load_courses(con, columns: list[str]) -> pd.DataFrame:
-    wanted = ["ref", "source", *MANDATORY_COLUMNS, "startDate", "endDate"]
+    wanted = ["ref", "source", *MANDATORY_COLUMNS, "startDate", "endDate", "degree", "type"]
     wanted += [column for column in columns if column.startswith("identifier.")]
     selected = [column for column in dict.fromkeys(wanted) if column in columns]
     if not selected:
@@ -26,35 +26,8 @@ def _load_courses(con, columns: list[str]) -> pd.DataFrame:
     ).fetchdf()
 
 
-def _rule(rule_id: str, dimension: str, validation: str, column: str,
-          description: str, reason: str, expectation, data) -> common.Rule:
-    return common.Rule(
-        id=rule_id,
-        dimension=dimension,
-        validation=validation,
-        column=column,
-        description=description,
-        reason=reason,
-        expectation=expectation,
-        data=data,
-    )
-
-
-def _broken_rule(rule_id: str, dimension: str, validation: str, column: str,
-                 description: str, problem: str) -> common.Rule:
-    def _raise():
-        raise ValueError(problem)
-
-    return common.Rule(
-        id=rule_id,
-        dimension=dimension,
-        validation=validation,
-        column=column,
-        description=description,
-        reason=problem,
-        expectation=None,
-        data=_raise,
-    )
+_rule = common.make_rule
+_broken_rule = common.make_broken_rule
 
 
 def _non_null_rows(courses: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -139,6 +112,19 @@ def _build_rules(columns: list[str], courses: pd.DataFrame) -> list[common.Rule]
             "Cada curso deve ter uma referência ref única.",
             f"Coluna obrigatória 'ref' ausente na view {ENTITY!r}.",
         ))
+
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=courses, columns=columns, column="degree",
+        authority_file="dominios.json", authority_fields=("course_degree",),
+        rule_id="CRS-AUT-DEGREE",
+        description="degree deve ser um grau aceito (graduation, specialization, master, doctoral, posDoctoral, fullProfessor ou equivalente em português).",
+    )
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=courses, columns=columns, column="type",
+        authority_file="dominios.json", authority_fields=("course_type",),
+        rule_id="CRS-AUT-TYPE",
+        description="type deve ser Academic/Professional (ou Acadêmico/Profissional).",
+    )
 
     for column in ["startDate", "endDate"]:
         rule_id = f"CRS-VAL-YEAR-{column.upper()}"

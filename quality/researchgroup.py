@@ -9,7 +9,7 @@ from quality import common
 
 ENTITY = "researchgroup"
 MANDATORY_COLUMNS = ["ref", "name", "identifier.brcris", "identifier.dgp"]
-URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
+URL_REGEX = common.URL_REGEX
 CURRENT_YEAR = date.today().year
 
 
@@ -23,35 +23,8 @@ def _load_researchgroups(con, columns: list[str]) -> pd.DataFrame:
     return con.execute(f"SELECT {projection} FROM {common.quote_ident(ENTITY)}").fetchdf()
 
 
-def _rule(rule_id: str, dimension: str, validation: str, column: str,
-          description: str, reason: str, expectation, data) -> common.Rule:
-    return common.Rule(
-        id=rule_id,
-        dimension=dimension,
-        validation=validation,
-        column=column,
-        description=description,
-        reason=reason,
-        expectation=expectation,
-        data=data,
-    )
-
-
-def _broken_rule(rule_id: str, dimension: str, validation: str, column: str,
-                 description: str, problem: str) -> common.Rule:
-    def _raise():
-        raise ValueError(problem)
-
-    return common.Rule(
-        id=rule_id,
-        dimension=dimension,
-        validation=validation,
-        column=column,
-        description=description,
-        reason=problem,
-        expectation=None,
-        data=_raise,
-    )
+_rule = common.make_rule
+_broken_rule = common.make_broken_rule
 
 
 def _non_null_rows(researchgroups: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -136,19 +109,18 @@ def _build_rules(con, columns: list[str], researchgroups: pd.DataFrame) -> list[
     if "URL" not in columns:
         rules.append(_broken_rule(
             "RGR-VAL-URL", "validade", "formato", "URL",
-            "URL deve conter uma URL HTTP ou HTTPS válida em formato básico.",
+            "URL deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).",
             f"Coluna 'URL' ausente na view {ENTITY!r}.",
         ))
     else:
         rules.append(_rule(
             "RGR-VAL-URL", "validade", "formato", "URL",
-            "URL deve conter uma URL HTTP ou HTTPS válida em formato básico.",
-            "O valor não corresponde ao formato básico de URL HTTP(S).",
+            "URL deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).",
+            "O valor não corresponde ao formato de endereço web (domínio com ponto, sem espaços).",
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=URL_REGEX),
-            lambda: _non_null_rows(researchgroups, "URL"),
+            lambda: common.split_tokens(researchgroups, "URL"),
         ))
     return rules
-
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

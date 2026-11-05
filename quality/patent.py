@@ -9,11 +9,17 @@ from quality import common
 ENTITY = "patent"
 MANDATORY_COLUMNS = ["identifier.espacenet", "title", "inventor"]
 DATE_REGEX = r"^(0[1-9]|[12][0-9]|3[01])/(0[1-9]|1[0-2])/([0-9]{4})$"
-URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
+URL_REGEX = common.URL_REGEX
+KIND_CODE_REGEX = r"^[A-Z][0-9]?$"                 # A, B1, C1, U2...
+COUNTRY_CODE_REGEX = r"^[A-Z]{2}$"                 # BR, US, WO...
+IPC_SECTION_REGEX = r"^[A-H]$"                     # seções IPC: A a H
+IPC_TEXT_REGEX = r"^[A-H][0-9]{2}[A-Z] ?[0-9]{1,4}/[0-9]{2,}$"   # ex.: A61K 31/00
+
 def _load_patents(con, columns: list[str]) -> pd.DataFrame:
     wanted = [
         "ref", "source", "identifier.espacenet", "title", "inventor",
-        "resourceUrl", "depositDate", "publicationDate",
+        "resourceUrl", "depositDate", "publicationDate", "kindCode", "countryCode",
+        "classification.ipc.section", "classification.ipc.text",
     ] + [c for c in columns if c.startswith("identifier.")]
     selected = [c for c in dict.fromkeys(wanted) if c in columns]
     if not selected:
@@ -22,22 +28,8 @@ def _load_patents(con, columns: list[str]) -> pd.DataFrame:
     return con.execute(f"SELECT {projection} FROM {common.quote_ident(ENTITY)}").fetchdf()
 
 
-def _broken_rule(rule_id: str, dimension: str, validation: str, column: str,
-                 description: str, problem: str) -> common.Rule:
-    def _raise():
-        raise ValueError(problem)
-    return common.Rule(
-        id=rule_id, dimension=dimension, validation=validation, column=column,
-        description=description, reason=problem, expectation=None, data=_raise,
-    )
-
-
-def _rule(rule_id: str, dimension: str, validation: str, column: str,
-          description: str, reason: str, expectation, data) -> common.Rule:
-    return common.Rule(
-        id=rule_id, dimension=dimension, validation=validation, column=column,
-        description=description, reason=reason, expectation=expectation, data=data,
-    )
+_rule = common.make_rule
+_broken_rule = common.make_broken_rule
 
 
 def _non_null_rows(patents: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -92,16 +84,39 @@ def _build_rules(con, columns: list[str], patents: pd.DataFrame) -> list[common.
     if "resourceUrl" in columns:
         rules.append(_rule(
             "PAT-VAL-RESOURCE-URL", "validade", "formato", "resourceUrl",
-            "resourceUrl deve conter uma URL HTTP ou HTTPS.",
-            "O valor de resourceUrl não corresponde ao formato básico de URL HTTP(S).",
+            "resourceUrl deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).",
+            "O valor de resourceUrl não corresponde ao formato de endereço web (domínio com ponto, sem espaços).",
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=URL_REGEX),
-            lambda: _non_null_rows(patents, "resourceUrl"),
+            lambda: common.split_tokens(patents, "resourceUrl"),
         ))
     else:
         rules.append(_broken_rule(
             "PAT-VAL-RESOURCE-URL", "validade", "formato", "resourceUrl",
-            "resourceUrl deve conter uma URL HTTP ou HTTPS.",
+            "resourceUrl deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).",
             f"Coluna resourceUrl ausente na view {ENTITY!r}.",
+        ))
+
+    # formato de códigos e classificação IPC (só quando a coluna existe)
+    for column, regex, rule_id, text, reason in [
+        ("kindCode", KIND_CODE_REGEX, "PAT-VAL-KINDCODE",
+         "kindCode deve ser uma letra, opcionalmente seguida de um dígito (ex.: A, B1, C1).",
+         "kindCode não tem o formato letra + dígito opcional."),
+        ("countryCode", COUNTRY_CODE_REGEX, "PAT-VAL-COUNTRYCODE",
+         "countryCode deve ter 2 letras maiúsculas (ex.: BR, US, WO).",
+         "countryCode não tem 2 letras maiúsculas."),
+        ("classification.ipc.section", IPC_SECTION_REGEX, "PAT-VAL-IPC-SECTION",
+         "Cada seção IPC deve ser uma letra de A a H.",
+         "A seção IPC não é uma letra de A a H."),
+        ("classification.ipc.text", IPC_TEXT_REGEX, "PAT-VAL-IPC-TEXT",
+         "Cada classificação IPC completa deve ter o formato seção+classe+subclasse grupo/subgrupo (ex.: A61K 31/00).",
+         "A classificação IPC não tem o formato A61K 31/00."),
+    ]:
+        if column not in columns:
+            continue
+        rules.append(_rule(
+            rule_id, "validade", "formato", column, text, reason,
+            gxe.ExpectColumnValuesToMatchRegex(column="value", regex=regex),
+            lambda column=column: common.split_tokens(patents, column),
         ))
 
     for column in ["depositDate", "publicationDate"]:
@@ -156,7 +171,6 @@ def _build_rules(con, columns: list[str], patents: pd.DataFrame) -> list[common.
             "Não foi possível comparar as datas: depositDate e/ou publicationDate ausente.",
         ))
     return rules
-
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

@@ -6,16 +6,19 @@ Padrão declarativo: cada regra é um common.Rule com uma Expectation do GX e os
 """
 from __future__ import annotations
 
+from datetime import date
+
 import pandas as pd
 import great_expectations.expectations as gxe
 
-from quality import authority, common
+from quality import authority, checks, common
 
 ENTITY = "person"
 
 # Obrigatoriedade: identifier.brcris não é obrigatório no modelo utilizado.
 MANDATORY_COLUMNS = ["identifier.lattes", "name", "ref"]
-LATTES_REGEX = r"^(?:https?://(?:www\.)?lattes\.cnpq\.br/)?[0-9]{10,16}/?$"
+# Lattes: exatamente 16 dígitos, sem URL e sem prefixo (o modelo diz "sem url").
+LATTES_REGEX = r"^[0-9]{16}$"
 ORCID_REGEX = r"^[0-9]{4}-[0-9]{4}-[0-9]{4}-[0-9]{3}[0-9Xx]$"
 # Verificação básica: texto sem espaços, um @ e um domínio com ponto.
 EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
@@ -23,7 +26,8 @@ EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 
 def _load_people(con, columns: list[str]) -> pd.DataFrame:
     """Carrega uma única vez somente as colunas usadas pelas regras de Person."""
-    wanted = ["ref", "source", "name", "email", "identifier.email", "birthCountry", "birthState", "birthCity"] + [
+    wanted = ["ref", "source", "name", "email", "identifier.email", "birthCountry", "birthState", "birthCity",
+              "personalURL", "birthDate"] + [
         c for c in columns if c.startswith("identifier.")
     ]
     selected = [c for c in dict.fromkeys(wanted) if c in columns]
@@ -33,25 +37,10 @@ def _load_people(con, columns: list[str]) -> pd.DataFrame:
     return con.execute(f"SELECT {projection} FROM {common.quote_ident(ENTITY)}").fetchdf()
 
 
-def _broken_rule(rule_id: str, validation: str, dimension: str, column: str,
-                 description: str, problem: str) -> common.Rule:
-    """Regra impossível de executar (schema incompatível): vira ERRO TÉCNICO explícito."""
-    def _raise():
-        raise ValueError(problem)
-    return common.Rule(
-        id=rule_id, dimension=dimension, validation=validation, column=column,
-        description=description, reason=problem, expectation=None, data=_raise,
-    )
+_broken_rule = common.make_broken_rule
 
 
-def _base_rule(rule_id: str, dimension: str, validation: str, column: str,
-               description: str, reason: str, expectation, data,
-               batch_data=None) -> common.Rule:
-    return common.Rule(
-        id=rule_id, dimension=dimension, validation=validation, column=column,
-        description=description, reason=reason, expectation=expectation, data=data,
-        batch_data=batch_data,
-    )
+_base_rule = common.make_rule
 
 
 def _build_rules(con, columns: list[str], people: pd.DataFrame) -> list[common.Rule]:
@@ -102,8 +91,8 @@ def _build_rules(con, columns: list[str], people: pd.DataFrame) -> list[common.R
     # 4. Formato textual dos identificadores.
     for column, regex, rule_id, description, reason in [
         ("identifier.lattes", LATTES_REGEX, "PER-VAL-01",
-         "Cada identificador Lattes deve conter apenas números.",
-         "Identificador Lattes contém caracteres que não são dígitos."),
+         "Cada identificador Lattes deve ter exatamente 16 dígitos, sem URL nem prefixo.",
+         "Identificador Lattes não tem exatamente 16 dígitos (pode conter prefixo, URL ou letras)."),
         ("identifier.orcid", ORCID_REGEX, "PER-VAL-02",
          "ORCID deve seguir o formato XXXX-XXXX-XXXX-XXXX (apenas o formato textual).",
          "ORCID não segue o formato XXXX-XXXX-XXXX-XXXX."),
@@ -116,6 +105,54 @@ def _build_rules(con, columns: list[str], people: pd.DataFrame) -> list[common.R
             rule_id, "validade", "validade", column, description, reason,
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=regex),
             lambda column=column: common.split_tokens(people, column),
+        ))
+
+    # 4b. ORCID: dígito verificador (só nos valores com formato correto).
+    if "identifier.orcid" in columns:
+        rules.append(common.make_check_rule(
+            "PER-VAL-ORCID-DV", "validade", "dígito verificador", "identifier.orcid",
+            "O dígito verificador do ORCID deve ser válido (avaliado nos valores com formato correto).",
+            "O dígito verificador do ORCID não confere.",
+            lambda: _format_ok_tokens(people, "identifier.orcid", ORCID_REGEX),
+            checks.iso7064_mod11_2,
+        ))
+
+    # 4c. CPF: 11 dígitos com dígito verificador.
+    if "identifier.cpf" in columns:
+        rules.append(common.make_check_rule(
+            "PER-VAL-CPF", "validade", "dígito verificador", "identifier.cpf",
+            "identifier.cpf, quando preenchido, deve ter 11 dígitos com dígito verificador válido.",
+            "O CPF não tem 11 dígitos ou o dígito verificador não confere.",
+            lambda: common.split_tokens(people, "identifier.cpf"),
+            checks.cpf,
+        ))
+
+    # 4d. personalURL (endereço web) e birthDate (data válida, não futura).
+    if "personalURL" in columns:
+        rules.append(_base_rule(
+            "PER-VAL-URL", "validade", "formato de URL", "personalURL",
+            "personalURL, quando preenchido, deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).",
+            "O valor de personalURL não corresponde ao formato de endereço web (domínio com ponto, sem espaços).",
+            gxe.ExpectColumnValuesToMatchRegex(column="value", regex=common.URL_REGEX),
+            lambda: common.split_tokens(people, "personalURL"),
+        ))
+    if "birthDate" in columns:
+        rules.append(common.make_check_rule(
+            "PER-VAL-BIRTHDATE", "validade", "data", "birthDate",
+            "birthDate, quando preenchida, deve ser uma data válida (dd/mm/aaaa, aaaa-mm-dd ou aaaa), entre 1900 e hoje.",
+            "birthDate não é uma data válida entre 1900 e hoje.",
+            lambda: _non_null_rows(people, "birthDate"),
+            _valid_birth_date,
+        ))
+
+    # 4e. brcris da pessoa é o MD5 do Lattes (só registros com um Lattes numérico e um brcris).
+    if {"identifier.lattes", "identifier.brcris"}.issubset(columns):
+        rules.append(common.make_check_rule(
+            "PER-CON-BRCRIS-LATTES", "consistência", "consistência entre campos", "identifier.brcris",
+            "identifier.brcris deve ser o MD5 do identifier.lattes do mesmo registro.",
+            "identifier.brcris não corresponde ao MD5 do identifier.lattes do mesmo registro.",
+            lambda: _lattes_brcris_pairs(people),
+            _brcris_matches_lattes,
         ))
 
     # 5. Consistência de identificadores entre pessoas: deduplica apenas repetições
@@ -180,6 +217,41 @@ def _build_rules(con, columns: list[str], people: pd.DataFrame) -> list[common.R
     return rules
 
 
+def _non_null_rows(people: pd.DataFrame, column: str) -> pd.DataFrame:
+    rows = common.base_rows(people, column)
+    return rows[rows["value"].notna()].reset_index(drop=True)
+
+
+def _format_ok_tokens(people: pd.DataFrame, column: str, regex: str) -> pd.DataFrame:
+    """Valores já no formato certo; só eles passam pela checagem do dígito verificador."""
+    rows = common.split_tokens(people, column)
+    return rows.loc[rows["value"].str.fullmatch(regex, na=False)].reset_index(drop=True)
+
+
+def _valid_birth_date(value) -> bool:
+    parsed = checks.parse_date(value)
+    return parsed is not None and date(1900, 1, 1) <= parsed <= date.today()
+
+
+def _lattes_brcris_pairs(people: pd.DataFrame) -> pd.DataFrame:
+    """Registros com Lattes de 16 dígitos e brcris preenchidos: value = 'lattes / brcris'."""
+    frame = people[["ref", "source", "identifier.lattes", "identifier.brcris"]].copy()
+    lattes = frame["identifier.lattes"].map(common.normalize_text)
+    brcris = frame["identifier.brcris"].map(common.normalize_text)
+    keep = lattes.str.fullmatch(LATTES_REGEX, na=False) & brcris.notna()
+    frame = frame.loc[keep].copy()
+    frame["record_value"] = lattes[keep] + " / " + brcris[keep]
+    frame["value"] = frame["record_value"]
+    frame = frame[["ref", "source", "record_value", "value"]].reset_index(drop=True)
+    frame.insert(0, "__dq_row_id", range(len(frame)))
+    return frame
+
+
+def _brcris_matches_lattes(pair: str) -> bool:
+    lattes, _, brcris = pair.partition(" / ")
+    return checks.md5_hex(lattes.strip()) == brcris.strip().lower()
+
+
 def _tokens_distinct_people(people: pd.DataFrame, column: str) -> pd.DataFrame:
     """Uma ocorrência por par ref/identificador; a Expectation detecta refs diferentes."""
     rows = common.split_tokens(people, column)
@@ -190,7 +262,6 @@ def _tokens_distinct_people(people: pd.DataFrame, column: str) -> pd.DataFrame:
     rows = rows.drop_duplicates(subset=["ref", "value"], keep="first").reset_index(drop=True)
     rows["__dq_row_id"] = range(len(rows))
     return rows
-
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

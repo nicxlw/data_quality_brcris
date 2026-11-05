@@ -47,7 +47,8 @@ tcc/
 ├── data/
 │   ├── raw/
 │   ├── parquet/
-│   │   └── <classe>/
+│   │   ├── <classe>/
+│   │   └── relation/
 │   └── tcc.duckdb
 ├── quality/
 │   ├── common.py
@@ -57,6 +58,8 @@ tcc/
 │   ├── patent.py
 │   ├── person.py
 │   ├── program.py
+│   ├── publication.py
+│   ├── relation.py
 │   ├── researchgroup.py
 │   └── software.py
 ├── results/
@@ -245,9 +248,34 @@ Isso também evita aumentar desnecessariamente o uso de armazenamento, algo rele
 
 # Regras de qualidade
 
-As regras são definidas em módulos próprios dentro de `quality/`: `journal`, `orgunit`, `patent`, `person`, `program`, `researchgroup` e `software`. Cada módulo expõe `validate()`, que devolve scores, ocorrências de erro e metadados. As Expectations do Great Expectations são executadas pelo mecanismo compartilhado em `quality/common.py`.
+As regras são definidas em módulos próprios dentro de `quality/`, incluindo `journal`, `orgunit`, `patent`, `person`, `program`, `publication`, `relation`, `researchgroup` e `software`. Cada módulo (exceto `publication` e `relation`) expõe `validate()`, que devolve scores, ocorrências de erro e metadados; as Expectations do Great Expectations são executadas pelo mecanismo compartilhado em `quality/common.py`. `publication` e `relation` só definem as regras e são executadas em SQL por `quality/fast.py`.
 
 As regras incluem verificações de completude, unicidade, formato, domínio e consistência referencial, conforme a entidade. Consulte o módulo correspondente para ver as regras e seus identificadores atualizados.
+
+## Validação de Publication
+
+`publication` tem milhões de linhas, então roda em SQL dentro do DuckDB (`quality/fast.py`), sem passar pelo Pandas. Todas as regras rodam de uma vez:
+
+```bash
+python run.py validate publication --skip-extract
+python run.py validate publication --skip-extract --sample-size 200000   # teste rápido
+python run.py validate publication --skip-extract --memory-limit 8GB     # limita a RAM
+```
+
+As regras ficam em `quality/publication.py` (só a definição: id, descrição, motivo). Todas as ocorrências de erro são gravadas em `results/publication/errors/<REGRA>.parquet`; `errors_sample.csv` traz até 1000 exemplos por regra e o relatório HTML mostra 5.
+
+## Validação de Relation
+
+`relation` é uma view agregada dos Parquets de relações produzidos pelas diversas fontes. Não tem um ZIP próprio. Também roda em SQL no DuckDB (`quality/fast.py`):
+
+```bash
+python run.py validate relation
+python run.py validate relation --sample-size 200000
+```
+
+O prefixo do semanticIdentifier (`lattes::`, `brcris::`, `docdb::`...) indica a coluna `identifier.<prefixo>` do alvo (`docdb` usa `identifier.espacenet`). O valor é normalizado antes de comparar: remove-se `prefixo::` e espaços; em `docdb` também se ignoram código do país, código de tipo e símbolos. Os exemplos do relatório mostram o valor original. A lista de regras (`RELATION_ENDPOINTS`) fica em `quality/relation.py`.
+
+O banco é aberto só para leitura. Feche o DBeaver ou outros programas que usem o mesmo arquivo DuckDB antes de executar.
 
 # Executando o projeto
 
@@ -265,10 +293,16 @@ Ative no Windows:
 .venv\Scripts\activate
 ```
 
-Instale as dependências declaradas no projeto:
+Instale ou atualize as dependências usando o mesmo interpretador que executará o projeto:
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --upgrade -r requirements.txt
+```
+
+O projeto utiliza Great Expectations 1.x. A versão 0.18.x não corresponde à faixa declarada no arquivo de dependências. Confira também se o DuckDB foi instalado no mesmo ambiente:
+
+```bash
+python -c "import sys, great_expectations, duckdb; print(sys.executable); print('GX:', great_expectations.__version__); print('DuckDB:', duckdb.__version__)"
 ```
 
 ## Dados
@@ -337,11 +371,13 @@ python run.py validate person
 
 `run.py`:
 
-1. importa `quality.<entidade>` e verifica se o módulo expõe `validate()`;
-2. executa a extração, a menos que `--skip-extract` seja informado;
-3. verifica a reconciliação XML x Parquet;
+1. importa `quality.<entidade>` e verifica se o módulo expõe `validate()` (`publication` e `relation` usam `quality/fast.py`);
+2. executa a extração, a menos que `--skip-extract` seja informado; para `relation`, reutiliza ou cria a view agregada, sem extrair um ZIP próprio;
+3. verifica a reconciliação XML x Parquet quando uma fonte é extraída;
 4. executa as validações e calcula os scores;
 5. salva resultados CSV/JSON e relatórios HTML.
+
+`--sample-size` e `--memory-limit` estão disponíveis só para `publication` e `relation`; sem `--sample-size`, a validação usa a base completa.
 
 Quando os dados já foram extraídos:
 
@@ -389,7 +425,7 @@ reports/
     └── report.html
 ```
 
-`scores.csv` e `scores.json` contêm os resultados por regra; `errors.csv` e `errors.json` listam as ocorrências inesperadas; `validation_summary.json` reúne os scores e contagens agregados; `gx_results.json` guarda os resultados de auditoria das Expectations. A validação também atualiza o resumo geral em `results/quality_summary.json` e `reports/quality_summary.html`.
+`scores.csv` e `scores.json` contêm os resultados por regra; `errors.csv` e `errors.json` listam todas as ocorrências inesperadas; `validation_summary.json` reúne os scores e contagens agregados; `gx_results.json` guarda os resultados de auditoria das Expectations. Durante a execução, as ocorrências são armazenadas temporariamente em JSON Lines no disco e exportadas em fluxo, evitando manter toda a lista na memória. A validação também atualiza o resumo geral em `results/quality_summary.json` e `reports/quality_summary.html`.
 
 # Reconciliação da extração
 
@@ -451,8 +487,8 @@ python run.py validate nova_entidade --skip-extract
 - **lxml** — processamento dos XMLs;
 - **PyYAML** — configuração das entidades;
 - **PyArrow / Parquet** — armazenamento intermediário;
-- **DuckDB** — consultas analíticas e camada SQL;
-- **Great Expectations** — validação da qualidade dos dados.
+- **DuckDB** — consultas analíticas, camada SQL e validação das tabelas grandes (publication e relation);
+- **Great Expectations** — validação da qualidade dos dados;
 
 # Referências
 

@@ -452,7 +452,6 @@ def worker_chunk(args: dict[str, Any]) -> dict[str, Any]:
     started = time.time()
 
     def flush(target: str) -> None:
-        nonlocal rows
         pending = rows[target]
         if not pending:
             return

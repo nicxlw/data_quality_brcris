@@ -1,6 +1,9 @@
-great_expectations>=1.0,<2.0
-duckdb
-pyarrow
+# O código do projeto usa a API Fluent do Great Expectations 1.x.
+great-expectations>=1.0,<2.0
+
+# Armazenamento e leitura dos dados.
+duckdb>=1.0,<2.0
+pyarrow>=15
+pandas>=2.0
 lxml
 pyyaml
-pandas

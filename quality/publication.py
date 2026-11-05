@@ -1,101 +1,54 @@
-"""Regras de qualidade de Publication, processadas em lotes para grandes volumes."""
+"""Definição das regras de Publication.
+
+Aqui ficam só as regras (id, descrição, motivo) e as constantes. A execução é feita
+em SQL no DuckDB por quality/fast.py, que é o que `python run.py validate publication`
+chama. Publication tem milhões de linhas, então não passa pelo Pandas.
+"""
 from __future__ import annotations
 
-import json
-import logging
 import re
-import time
+from dataclasses import dataclass
 from datetime import date, datetime
-from pathlib import Path
-from typing import Callable, Iterator
 
-import pandas as pd
-import great_expectations.expectations as gxe
-
-from quality import authority, common
+from quality import common
 
 ENTITY = "publication"
-BATCH_ROWS = 50_000
-# Para unicidade, o mesmo valor precisa cair sempre no mesmo lote. Hash-particionar
-# impede que duplicatas entre blocos sejam perdidas.
-UNIQUE_PARTITIONS = 64
 MANDATORY_COLUMNS = ["ref", "title", "author", "type", "identifier.brcris"]
 DATE_COLUMNS = ["publicationDate", "defenceDay", "degreeDate"]
-URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
+URL_REGEX = common.URL_REGEX
 NUMBER_REGEX = r"^[+-]?(?:[0-9]+(?:[.,][0-9]*)?|[.,][0-9]+)(?:[eE][+-]?[0-9]+)?$"
 CURRENT_YEAR = date.today().year
-LOG = logging.getLogger("quality.publication")
+MIN_YEAR = 1500                       # anos anteriores são tratados como erro de digitação
+DOI_REGEX = r"^10\.[0-9]{4,9}/[^\s]+$"
+# DOI e ISBN se repetem de forma legítima entre capítulos e o livro; a unicidade ignora esses tipos
+UNIQUE_SKIP_BOOK_TYPES = ("identifier.doi", "identifier.isbn")
+BOOK_TYPES = ("capitulo de livro", "livro")          # comparados sem acento e em minúsculas
 
 
-def _log(message: str) -> None:
-    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [publication] {message}", flush=True)
+@dataclass
+class RuleDef:
+    """Uma regra de Publication. `problem` preenchido = regra impossível (coluna ausente)."""
+    id: str
+    dimension: str
+    validation: str
+    column: str
+    description: str
+    reason: str
+    problem: str | None = None
 
 
-def _rule(rule_id: str, dimension: str, validation: str, column: str,
-          description: str, reason: str, expectation, batch_data: Callable[[], Iterator[pd.DataFrame]]) -> common.Rule:
-    return common.Rule(
-        id=rule_id, dimension=dimension, validation=validation, column=column,
-        description=description, reason=reason, expectation=expectation,
-        data=None, batch_data=batch_data,
-    )
+DOMAIN_NOTE_TYPES = ("Artigo", "Dissertação", "Capítulo de Livro", "Tese", "Livro",
+                     "Artigo de Conferência", "Preprint", "Conjunto de Dados")
 
 
-def _broken_rule(rule_id: str, dimension: str, validation: str, column: str,
-                 description: str, problem: str) -> common.Rule:
-    def _raise():
-        raise ValueError(problem)
-    return common.Rule(
-        id=rule_id, dimension=dimension, validation=validation, column=column,
-        description=description, reason=problem, expectation=None, data=_raise,
-    )
-
-
-def _sql_batches(query: str, params: list | None = None,
-                 prepare: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
-                 chunk_rows: int = BATCH_ROWS) -> Iterator[pd.DataFrame]:
-    """Executa consulta em blocos pequenos para limitar o pico de memória."""
-    # DuckDB fetch_df_chunk usa vetores (normalmente 2.048 linhas por vetor).
-    vectors = max(1, (chunk_rows + 2047) // 2048)
-    con = common.connect(read_only=True)
-    try:
-        result = con.execute(query, params or [])
-        batch_no = 0
-        while True:
-            frame = result.fetch_df_chunk(vectors_per_chunk=vectors)
-            if frame is None or frame.empty:
-                break
-            batch_no += 1
-            if prepare:
-                frame = prepare(frame)
-            if not frame.empty:
-                _log(f"lote {batch_no}: {len(frame):,} registros preparados")
-                yield frame.reset_index(drop=True)
-            del frame
-    finally:
-        con.close()
-
-
-def _base_prepare(column: str) -> Callable[[pd.DataFrame], pd.DataFrame]:
-    def prepare(frame: pd.DataFrame) -> pd.DataFrame:
-        return common.base_rows(frame, column)
-    return prepare
-
-
-def _non_null_prepare(column: str) -> Callable[[pd.DataFrame], pd.DataFrame]:
-    def prepare(frame: pd.DataFrame) -> pd.DataFrame:
-        rows = common.base_rows(frame, column)
-        return rows[rows["value"].notna()].reset_index(drop=True)
-    return prepare
-
-
-def _date_year(value) -> int | None:
+def date_year(value) -> int | None:
+    """Ano de um valor de data (ano, ISO ou dd/mm/aaaa); None se não der para ler."""
     normalized = common.normalize_text(value)
     if normalized is None:
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        number = pd.to_numeric(value, errors="coerce")
-        if pd.notna(number) and float(number).is_integer():
-            return int(number)
+        if float(value).is_integer():
+            return int(value)
     if re.fullmatch(r"[0-9]{4}", normalized):
         return int(normalized)
     try:
@@ -108,303 +61,88 @@ def _date_year(value) -> int | None:
         return None
 
 
-def _date_prepare(column: str) -> Callable[[pd.DataFrame], pd.DataFrame]:
-    def prepare(frame: pd.DataFrame) -> pd.DataFrame:
-        rows = common.base_rows(frame, column)
-        years = rows["record_value"].map(_date_year)
-        invalid = rows["value"].notna() & years.isna()
-        years.loc[invalid] = CURRENT_YEAR + 1
-        rows["value"] = years
-        return rows
-    return prepare
+def build_rules(columns: list[str], sample_size: int | None = None) -> list[RuleDef]:
+    rules: list[RuleDef] = []
+    scope = (f"na amostra repetível de até {sample_size:,} registros"
+             if sample_size is not None else "na base completa")
 
+    def add(rule_id, dimension, validation, column, description, reason, missing=None):
+        """`missing`: mensagem de problema quando a coluna necessária não existe."""
+        rules.append(RuleDef(rule_id, dimension, validation, column, description,
+                             missing or reason, problem=missing))
 
-
-def _sql_partition(query: str, params: list | None = None) -> Iterator[pd.DataFrame]:
-    """Carrega uma única partição hash, mantendo duplicatas de um valor juntas."""
-    con = common.connect(read_only=True)
-    try:
-        frame = con.execute(query, params or []).fetchdf()
-        if not frame.empty:
-            _log(f"partição carregada: {len(frame):,} registros")
-            yield frame.reset_index(drop=True)
-    finally:
-        con.close()
-
-
-def _unique_token_batches(column: str) -> Iterator[pd.DataFrame]:
-    """Particiona por hash do token: duplicatas iguais ficam no mesmo lote GX."""
-    quoted = common.quote_ident(column)
-    for partition in range(UNIQUE_PARTITIONS):
-        query = f'''SELECT "ref", "source", CAST({quoted} AS VARCHAR) AS record_value,
-                           trim(token.value) AS value
-                    FROM "{ENTITY}",
-                         UNNEST(string_split(CAST({quoted} AS VARCHAR), '|')) AS token(value)
-                    WHERE {quoted} IS NOT NULL
-                      AND trim(token.value) <> ''
-                      AND hash(trim(token.value)) % {UNIQUE_PARTITIONS} = ?'''
-        _log(f"unicidade de {column}: partição {partition + 1}/{UNIQUE_PARTITIONS}")
-        yield from _sql_partition(query, [partition])
-
-
-def _unique_ref_batches() -> Iterator[pd.DataFrame]:
-    quoted = common.quote_ident("ref")
-    for partition in range(UNIQUE_PARTITIONS):
-        query = f'''SELECT "ref", "source", CAST({quoted} AS VARCHAR) AS record_value,
-                           trim(CAST({quoted} AS VARCHAR)) AS value
-                    FROM "{ENTITY}"
-                    WHERE {quoted} IS NOT NULL AND trim(CAST({quoted} AS VARCHAR)) <> ''
-                      AND hash(trim(CAST({quoted} AS VARCHAR))) % {UNIQUE_PARTITIONS} = ?'''
-        _log(f"unicidade de ref: partição {partition + 1}/{UNIQUE_PARTITIONS}")
-        yield from _sql_partition(query, [partition])
-
-
-def _authority_language_batches() -> Iterator[pd.DataFrame]:
-    values = authority.authority_values(
-        "language2026.json", ("sigla", "name_original", "name_pt", "name_en")
-    )
-    query = '''SELECT "ref", "source", "language" AS record_value
-               FROM "publication" WHERE "language" IS NOT NULL
-                 AND trim(CAST("language" AS VARCHAR)) <> '' '''
-
-    def prepare(frame: pd.DataFrame) -> pd.DataFrame:
-        rows = common.base_rows(frame, "record_value")
-        rows["value"] = rows["value"].map(authority.normalize_authority)
-        return rows[rows["value"].notna()].reset_index(drop=True)
-
-    yield from _sql_batches(query, prepare=prepare)
-
-
-def _build_rules(columns: list[str]) -> list[common.Rule]:
-    rules: list[common.Rule] = []
+    # Unicidade de cada coluna identifier.* (valores separados por '|')
     identifier_columns = [c for c in columns if c.startswith("identifier.")]
-
     for number, column in enumerate(identifier_columns, start=1):
-        rules.append(_rule(
-            f"PUB-UNI-ID-{number:02d}", "unicidade", "unicidade", column,
-            f"Cada valor de {column} deve ser único entre as publicações.",
-            f"Valor de {column} duplicado.",
-            gxe.ExpectColumnValuesToBeUnique(column="value"),
-            lambda column=column: _unique_token_batches(column),
-        ))
+        if column in UNIQUE_SKIP_BOOK_TYPES:
+            add(f"PUB-UNI-ID-{number:02d}", "unicidade", "unicidade", column,
+                f"Cada valor de {column} deve ser único {scope}, exceto em publicações do tipo Capítulo de Livro ou Livro "
+                f"(que podem compartilhar o valor).", f"Valor de {column} duplicado entre publicações que não são capítulo nem livro.",
+                missing=None if "type" in columns else f"Coluna 'type' ausente na view {ENTITY!r}.")
+            continue
+        add(f"PUB-UNI-ID-{number:02d}", "unicidade", "unicidade", column,
+            f"Cada valor de {column} deve ser único {scope}.", f"Valor de {column} duplicado.")
 
+    # Completude das colunas obrigatórias
     for column in MANDATORY_COLUMNS:
-        rule_id = f"PUB-COM-{column.replace('.', '-').upper()}"
-        description = f"{column} deve estar preenchido."
-        if column not in columns:
-            rules.append(_broken_rule(rule_id, "completude", "completude", column,
-                                      description, f"Coluna obrigatória {column!r} ausente na view {ENTITY!r}."))
-            continue
-        query = f'''SELECT "ref", "source", {common.quote_ident(column)} AS "{column}"
-                    FROM "{ENTITY}"'''
-        rules.append(_rule(
-            rule_id, "completude", "completude", column, description,
-            f"{column} está nulo, vazio ou contém apenas espaços.",
-            gxe.ExpectColumnValuesToNotBeNull(column="value"),
-            lambda query=query, column=column: _sql_batches(query, prepare=_base_prepare(column)),
-        ))
+        add(f"PUB-COM-{column.replace('.', '-').upper()}", "completude", "completude", column,
+            f"{column} deve estar preenchido.", f"{column} está nulo, vazio ou contém apenas espaços.",
+            missing=None if column in columns else f"Coluna obrigatória {column!r} ausente na view {ENTITY!r}.")
 
-    if "ref" in columns:
-        rules.append(_rule(
-            "PUB-UNI-REF", "unicidade", "unicidade", "ref",
-            "Cada publicação deve ter uma referência ref única.",
-            "A referência ref está associada a mais de um registro.",
-            gxe.ExpectColumnValuesToBeUnique(column="value"), _unique_ref_batches,
-        ))
-    else:
-        rules.append(_broken_rule("PUB-UNI-REF", "unicidade", "unicidade", "ref",
-                                  "Cada publicação deve ter uma referência ref única.",
-                                  f"Coluna obrigatória 'ref' ausente na view {ENTITY!r}."))
+    add("PUB-UNI-REF", "unicidade", "unicidade", "ref",
+        f"Cada referência ref deve ser única {scope}.", "A referência ref está associada a mais de um registro.",
+        missing=None if "ref" in columns else f"Coluna obrigatória 'ref' ausente na view {ENTITY!r}.")
 
+    # Ano das datas: entre MIN_YEAR e o ano atual
     for column in DATE_COLUMNS:
-        rule_id = f"PUB-VAL-YEAR-{column.upper()}"
-        description = f"{column} deve ser menor ou igual ao ano atual ({CURRENT_YEAR})."
-        if column not in columns:
-            rules.append(_broken_rule(rule_id, "validade", "limite", column, description,
-                                      f"Coluna {column!r} ausente na view {ENTITY!r}."))
-            continue
-        query = f'''SELECT "ref", "source", {common.quote_ident(column)} AS "{column}"
-                    FROM "{ENTITY}"'''
-        rules.append(_rule(
-            rule_id, "validade", "limite", column, description,
-            f"{column} é posterior ao ano atual ou não contém um ano/data válida.",
-            gxe.ExpectColumnValuesToBeBetween(column="value", max_value=CURRENT_YEAR),
-            lambda query=query, column=column: _sql_batches(query, prepare=_date_prepare(column)),
-        ))
+        add(f"PUB-VAL-YEAR-{column.upper()}", "validade", "limite", column,
+            f"{column} deve ter ano de 4 dígitos entre {MIN_YEAR} e o ano atual ({CURRENT_YEAR}).",
+            f"{column} tem ano anterior a {MIN_YEAR}, posterior ao ano atual, ou não é uma data/ano válido.",
+            missing=None if column in columns else f"Coluna {column!r} ausente na view {ENTITY!r}.")
 
     for column in ["startPage", "endPage"]:
-        rule_id = f"PUB-VAL-NUM-{column.upper()}"
-        description = f"{column} deve conter um valor numérico quando preenchido."
-        if column not in columns:
-            rules.append(_broken_rule(rule_id, "validade", "formato numérico", column, description,
-                                      f"Coluna {column!r} ausente na view {ENTITY!r}."))
-            continue
-        query = f'''SELECT "ref", "source", {common.quote_ident(column)} AS "{column}"
-                    FROM "{ENTITY}" WHERE {common.quote_ident(column)} IS NOT NULL
-                      AND trim(CAST({common.quote_ident(column)} AS VARCHAR)) <> '' '''
-        rules.append(_rule(
-            rule_id, "validade", "formato numérico", column, description,
-            f"O valor de {column} não é numérico.",
-            gxe.ExpectColumnValuesToMatchRegex(column="value", regex=NUMBER_REGEX),
-            lambda query=query, column=column: _sql_batches(query, prepare=_base_prepare(column)),
-        ))
+        add(f"PUB-VAL-NUM-{column.upper()}", "validade", "formato numérico", column,
+            f"{column} deve conter um valor numérico quando preenchido.", f"O valor de {column} não é numérico.",
+            missing=None if column in columns else f"Coluna {column!r} ausente na view {ENTITY!r}.")
 
-    # A origem pode preservar a grafia resourceURL/resourceUrl. O alias explícito
-    # garante que o DataFrame sempre exponha a chave exata usada por base_rows.
-    resource_url_column = next((c for c in columns if c.casefold() == "resourceurl"), None)
-    if resource_url_column is None:
-        rules.append(_broken_rule("PUB-VAL-RESOURCE-URL", "validade", "formato de URL", "resourceUrl",
-                                  "resourceUrl deve conter uma URL HTTP ou HTTPS quando preenchido.",
-                                  f"Coluna equivalente a 'resourceUrl' ausente na view {ENTITY!r}."))
-    else:
-        quoted_url = common.quote_ident(resource_url_column)
-        query = (f'SELECT "ref", "source", {quoted_url} AS "resourceUrl" '
-                 f'FROM "publication" WHERE {quoted_url} IS NOT NULL '
-                 f'AND trim(CAST({quoted_url} AS VARCHAR)) <> ' + "''")
-        rules.append(_rule(
-            "PUB-VAL-RESOURCE-URL", "validade", "formato de URL", "resourceUrl",
-            "resourceUrl deve conter uma URL HTTP ou HTTPS quando preenchido.",
-            "O valor de resourceUrl não corresponde ao formato básico de URL HTTP(S).",
-            gxe.ExpectColumnValuesToMatchRegex(column="value", regex=URL_REGEX),
-            lambda: _sql_batches(query, prepare=_base_prepare("resourceUrl")),
-        ))
+    add("PUB-VAL-PAGES-ORDER", "validade", "consistência entre campos", "startPage",
+        "startPage não pode ser maior que endPage (avaliado quando ambos são numéricos).",
+        "startPage é maior que endPage.",
+        missing=None if {"startPage", "endPage"}.issubset(columns) else f"Coluna startPage ou endPage ausente na view {ENTITY!r}.")
 
-    if not {"type", "advisor"}.issubset(columns):
-        missing = sorted({"type", "advisor"} - set(columns))
-        rules.append(_broken_rule("PUB-COM-THESIS-ADVISOR", "completude", "completude", "advisor",
-                                  "Publicações do tipo Tese devem ter advisor preenchido.",
-                                  f"Validação de advisor impossível: coluna(s) ausente(s) na view {ENTITY!r}: {missing}."))
-    else:
-        query = '''SELECT "ref", "source", "advisor" FROM "publication"
-                   WHERE lower(trim(CAST("type" AS VARCHAR))) = 'tese' '''
-        rules.append(_rule(
-            "PUB-COM-THESIS-ADVISOR", "completude", "completude", "advisor",
-            "Publicações do tipo Tese devem ter advisor preenchido.",
-            "advisor está nulo ou vazio em uma publicação do tipo Tese.",
-            gxe.ExpectColumnValuesToNotBeNull(column="value"),
-            lambda: _sql_batches(query, prepare=_base_prepare("advisor")),
-        ))
+    add("PUB-VAL-DOI", "validade", "formato", "identifier.doi",
+        "Cada DOI em identifier.doi deve começar com 10.<4 a 9 dígitos>/ seguido do sufixo, sem espaços.",
+        "O valor não tem o formato de um DOI (10.xxxx/sufixo).",
+        missing=None if "identifier.doi" in columns else f"Coluna 'identifier.doi' ausente na view {ENTITY!r}.")
+    add("PUB-VAL-ISBN-DV", "validade", "dígito verificador", "identifier.isbn",
+        "Cada ISBN em identifier.isbn deve ser um ISBN-10 ou ISBN-13 com dígito verificador válido (hifens ignorados).",
+        "O ISBN não tem 10/13 dígitos ou o dígito verificador não confere.",
+        missing=None if "identifier.isbn" in columns else f"Coluna 'identifier.isbn' ausente na view {ENTITY!r}.")
+    add("PUB-AUT-TYPE", "validade", "lista de autoridade", "type",
+        "type deve ser um dos tipos aceitos: " + ", ".join(DOMAIN_NOTE_TYPES) + ".",
+        "O valor de type não consta na lista de tipos aceitos (dominios.json).",
+        missing=None if "type" in columns else f"Coluna 'type' ausente na view {ENTITY!r}.")
+    add("PUB-AUT-ACCESSTYPE", "validade", "lista de autoridade", "accessType",
+        "accessType deve ser um dos valores aceitos (open/embargoed/restricted/metadata only access, ou equivalentes em português).",
+        "O valor de accessType não consta na lista de valores aceitos (dominios.json).",
+        missing=None if "accessType" in columns else f"Coluna 'accessType' ausente na view {ENTITY!r}.")
 
-    if "language" not in columns:
-        rules.append(_broken_rule("PUB-AUT-LANGUAGE", "validade", "lista de autoridade", "language",
-                                  "language deve corresponder a um código ou nome de idioma aceito.",
-                                  f"Coluna 'language' ausente na view {ENTITY!r}."))
-    else:
-        values = authority.authority_values(
-            "language2026.json", ("sigla", "name_original", "name_pt", "name_en")
-        )
-        rules.append(_rule(
-            "PUB-AUT-LANGUAGE", "validade", "lista de autoridade", "language",
-            "language deve corresponder a um código ou nome de idioma aceito.",
-            "O valor de language não consta na lista de autoridade language2026.json.",
-            gxe.ExpectColumnValuesToBeInSet(column="value", value_set=set(values)),
-            _authority_language_batches,
-        ))
+    # A origem pode usar resourceURL ou resourceUrl
+    add("PUB-VAL-RESOURCE-URL", "validade", "formato de URL", "resourceUrl",
+        "resourceUrl deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com) quando preenchido.",
+        "O valor de resourceUrl não corresponde ao formato de endereço web (domínio com ponto, sem espaços).",
+        missing=None if any(c.casefold() == "resourceurl" for c in columns)
+        else f"Coluna equivalente a 'resourceUrl' ausente na view {ENTITY!r}.")
 
+    missing_cols = sorted({"type", "advisor"} - set(columns))
+    add("PUB-COM-THESIS-ADVISOR", "completude", "completude", "advisor",
+        "Publicações do tipo Tese devem ter advisor preenchido.",
+        "advisor está nulo ou vazio em uma publicação do tipo Tese.",
+        missing=(f"Validação de advisor impossível: coluna(s) ausente(s) na view {ENTITY!r}: {missing_cols}."
+                 if missing_cols else None))
+
+    add("PUB-AUT-LANGUAGE", "validade", "lista de autoridade", "language",
+        "language deve corresponder a um código ou nome de idioma aceito.",
+        "O valor de language não consta na lista de autoridade language2026.json.",
+        missing=None if "language" in columns else f"Coluna 'language' ausente na view {ENTITY!r}.")
     return rules
-
-
-GROUPS = ("unicidade", "completude", "validade")
-GROUP_RESULTS_DIR = common.RESULTS_DIR / ENTITY / "grupos"
-
-
-def _group_file(group: str) -> Path:
-    return GROUP_RESULTS_DIR / f"{group}.json"
-
-
-def _save_group(group: str, scores: list[dict], errors: list[dict], metadata: dict) -> None:
-    GROUP_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    common.write_json(_group_file(group), {
-        "group": group, "scores": scores, "errors": errors, "metadata": metadata,
-    })
-
-
-def _load_group_results() -> tuple[list[dict], list[dict], list[dict], list[str]]:
-    """Reúne resultados persistidos; cada grupo é substituído quando executado novamente."""
-    scores_by_id: dict[str, dict] = {}
-    errors_by_key: dict[tuple, dict] = {}
-    audits_by_id: dict[str, dict] = {}
-    loaded_groups: list[str] = []
-    for group in GROUPS:
-        path = _group_file(group)
-        if not path.exists():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Não foi possível ler resultados do grupo {group}: {exc}") from exc
-        loaded_groups.append(group)
-        for score in payload.get("scores", []):
-            scores_by_id[score["rule_id"]] = score
-        for error in payload.get("errors", []):
-            # A ocorrência é identificada por regra, ref, coluna e valor inesperado.
-            key = (error.get("rule_id"), error.get("ref"), error.get("column"),
-                   error.get("value"), error.get("reason"))
-            errors_by_key[key] = error
-        for audit in payload.get("metadata", {}).get("gx_results", []):
-            audits_by_id[audit.get("rule_id", str(len(audits_by_id)))] = audit
-    scores = sorted(scores_by_id.values(), key=lambda row: row.get("rule_id", ""))
-    errors = list(errors_by_key.values())
-    audits = list(audits_by_id.values())
-    return scores, errors, audits, loaded_groups
-
-
-def validate(group: str | None = None) -> tuple[list[dict], list[dict], dict]:
-    """Executa todas as regras ou um grupo e atualiza o resultado consolidado.
-
-    Grupos disponíveis: unicidade, completude e validade. Os resultados de cada
-    grupo ficam em results/publication/grupos/ e o relatório normal continua
-    sendo gerado pelo runner a partir da consolidação dos grupos já executados.
-    """
-    if group is not None and group not in GROUPS:
-        raise ValueError(f"Grupo inválido: {group!r}. Use um de: {', '.join(GROUPS)}.")
-
-    started = time.perf_counter()
-    _log("iniciando validação de publication em grupos")
-    with common.connect() as con:
-        columns = common.get_columns(con, ENTITY)
-        record_count = con.execute(f'SELECT COUNT(*) FROM "{ENTITY}"').fetchone()[0]
-    _log(f"view encontrada: {record_count:,} registros; {len(columns)} colunas")
-    rules = _build_rules(columns)
-    if group is None:
-        selected_groups = GROUPS
-        selected_rules = rules
-    else:
-        selected_groups = (group,)
-        selected_rules = [rule for rule in rules if rule.dimension == group]
-
-    _log(f"{len(selected_rules)} regras selecionadas; grupo(s): {', '.join(selected_groups)}; lote alvo: {BATCH_ROWS:,}")
-    scores, errors, metadata = common.run_quality_checks(
-        ENTITY, selected_rules,
-        extra_metadata={"record_count": record_count, "batch_rows": BATCH_ROWS,
-                   "executed_groups": list(selected_groups)},
-    )
-
-    # Em execução completa, substitui os três grupos; em execução parcial,
-    # atualiza somente o grupo solicitado e preserva os demais resultados.
-    if group is None:
-        for current_group in GROUPS:
-            group_scores = [row for row in scores if row.get("dimension") == current_group]
-            rule_ids = {row["rule_id"] for row in group_scores}
-            group_errors = [row for row in errors if row.get("rule_id") in rule_ids]
-            group_audits = [row for row in metadata.get("gx_results", []) if row.get("rule_id") in rule_ids]
-            _save_group(current_group, group_scores, group_errors, {**metadata, "gx_results": group_audits})
-    else:
-        _save_group(group, scores, errors, metadata)
-
-    all_scores, all_errors, all_audits, loaded_groups = _load_group_results()
-    consolidated_metadata = {
-        "entity": ENTITY,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "validation_engine": metadata.get("validation_engine"),
-        "gx_result_format": "COMPLETE",
-        "gx_results": all_audits,
-        "score_formula": metadata.get("score_formula"),
-        "record_count": record_count,
-        "batch_rows": BATCH_ROWS,
-        "groups_available": loaded_groups,
-        "groups_missing": [item for item in GROUPS if item not in loaded_groups],
-        "partial_report": len(loaded_groups) < len(GROUPS),
-    }
-    _log(f"grupo(s) concluído(s) em {time.perf_counter() - started:.1f}s; relatório reúne {len(all_scores)} regras de {len(loaded_groups)}/{len(GROUPS)} grupos")
-    return all_scores, all_errors, consolidated_metadata

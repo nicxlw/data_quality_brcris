@@ -5,16 +5,17 @@ from datetime import date
 
 import pandas as pd
 import great_expectations.expectations as gxe
-from quality import authority, common
+from quality import authority, checks, common
 
 ENTITY = "software"
 MANDATORY_COLUMNS = ["ref", "title", "identifier.brcris", "identifier.inpi"]
-URL_REGEX = r"^https?://[^\s./]+(?:\.[^\s./]+)+(?:[/:?#][^\s]*)?$"
+URL_REGEX = common.URL_REGEX
 CURRENT_YEAR = date.today().year
 
 
 def _load_software(con, columns: list[str]) -> pd.DataFrame:
-    wanted = ["ref", "source", "title", "identifier.brcris", "identifier.inpi", "releaseYear", "urlINPI", "registrationCountry", "language"]
+    wanted = ["ref", "source", "title", "identifier.brcris", "identifier.inpi", "releaseYear", "urlINPI", "registrationCountry", "language",
+              "depositDate", "concessionDate", "kind"]
     wanted += [column for column in columns if column.startswith("identifier.")]
     selected = [column for column in dict.fromkeys(wanted) if column in columns]
     if not selected:
@@ -23,40 +24,38 @@ def _load_software(con, columns: list[str]) -> pd.DataFrame:
     return con.execute(f"SELECT {projection} FROM {common.quote_ident(ENTITY)}").fetchdf()
 
 
-def _rule(rule_id: str, dimension: str, validation: str, column: str,
-          description: str, reason: str, expectation, data) -> common.Rule:
-    return common.Rule(
-        id=rule_id,
-        dimension=dimension,
-        validation=validation,
-        column=column,
-        description=description,
-        reason=reason,
-        expectation=expectation,
-        data=data,
-    )
-
-
-def _broken_rule(rule_id: str, dimension: str, validation: str, column: str,
-                 description: str, problem: str) -> common.Rule:
-    def _raise():
-        raise ValueError(problem)
-
-    return common.Rule(
-        id=rule_id,
-        dimension=dimension,
-        validation=validation,
-        column=column,
-        description=description,
-        reason=problem,
-        expectation=None,
-        data=_raise,
-    )
+_rule = common.make_rule
+_broken_rule = common.make_broken_rule
 
 
 def _non_null_rows(software: pd.DataFrame, column: str) -> pd.DataFrame:
     rows = common.base_rows(software, column)
     return rows[rows["value"].notna()].reset_index(drop=True)
+
+
+def _valid_date(value) -> bool:
+    parsed = checks.parse_date(value)
+    return parsed is not None and date(1900, 1, 1) <= parsed <= date.today()
+
+
+def _date_pairs(software: pd.DataFrame) -> pd.DataFrame:
+    """Registros com as duas datas legíveis: value = 'depósito / concessão'."""
+    frame = software[["ref", "source", "depositDate", "concessionDate"]].copy()
+    dep = frame["depositDate"].map(common.normalize_text)
+    con = frame["concessionDate"].map(common.normalize_text)
+    keep = dep.map(lambda v: v is not None and checks.parse_date(v) is not None) & \
+        con.map(lambda v: v is not None and checks.parse_date(v) is not None)
+    out = frame.loc[keep, ["ref", "source"]].copy()
+    out["record_value"] = dep[keep] + " / " + con[keep]
+    out["value"] = out["record_value"]
+    out = out.reset_index(drop=True)
+    out.insert(0, "__dq_row_id", range(len(out)))
+    return out
+
+
+def _concession_not_before_deposit(pair: str) -> bool:
+    deposit, _, concession = pair.partition(" / ")
+    return checks.parse_date(concession) >= checks.parse_date(deposit)
 
 
 def _build_rules(con, columns: list[str], software: pd.DataFrame) -> list[common.Rule]:
@@ -136,17 +135,41 @@ def _build_rules(con, columns: list[str], software: pd.DataFrame) -> list[common
     if "urlINPI" not in columns:
         rules.append(_broken_rule(
             "SFT-VAL-URLINPI", "validade", "formato", "urlINPI",
-            "urlINPI deve conter uma URL HTTP ou HTTPS válida em formato básico.",
+            "urlINPI deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).",
             f"Coluna 'urlINPI' ausente na view {ENTITY!r}.",
         ))
     else:
         rules.append(_rule(
             "SFT-VAL-URLINPI", "validade", "formato", "urlINPI",
-            "urlINPI deve conter uma URL HTTP ou HTTPS válida em formato básico.",
-            "O valor não corresponde ao formato básico de URL HTTP(S).",
+            "urlINPI deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).",
+            "O valor não corresponde ao formato de endereço web (domínio com ponto, sem espaços).",
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=URL_REGEX),
-            lambda: _non_null_rows(software, "urlINPI"),
+            lambda: common.split_tokens(software, "urlINPI"),
         ))
+    # datas de depósito e concessão: data válida, não futura
+    for column in ("depositDate", "concessionDate"):
+        if column in columns:
+            rules.append(common.make_check_rule(
+                f"SFT-VAL-{column.replace('Date', '').upper()}-DATE", "validade", "data", column,
+                f"{column}, quando preenchida, deve ser uma data válida (dd/mm/aaaa, aaaa-mm-dd ou aaaa), entre 1900 e hoje.",
+                f"{column} não é uma data válida entre 1900 e hoje.",
+                lambda column=column: _non_null_rows(software, column),
+                _valid_date,
+            ))
+    if {"depositDate", "concessionDate"}.issubset(columns):
+        rules.append(common.make_check_rule(
+            "SFT-VAL-CONCESSION-AFTER-DEPOSIT", "consistência", "ordem temporal", "concessionDate",
+            "concessionDate não pode ser anterior a depositDate (avaliado quando ambas são datas válidas).",
+            "concessionDate é anterior a depositDate.",
+            lambda: _date_pairs(software),
+            _concession_not_before_deposit,
+        ))
+    authority.add_authority_rule(
+        rules, entity=ENTITY, frame=software, columns=columns, column="kind",
+        authority_file="dominios.json", authority_fields=("software_kind",),
+        rule_id="SFT-AUT-KIND",
+        description="kind deve ser um dos valores aceitos: COMPUTACIONAL, MULTIMIDIA ou OUTRO.",
+    )
     authority.add_authority_rule(
         rules, entity=ENTITY, frame=software, columns=columns, column="registrationCountry",
         authority_file="country_authority.json", authority_fields=("code", "name"),
@@ -162,7 +185,6 @@ def _build_rules(con, columns: list[str], software: pd.DataFrame) -> list[common
     )
 
     return rules
-
 
 
 def validate() -> tuple[list[dict], list[dict], dict]:

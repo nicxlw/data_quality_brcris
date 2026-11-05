@@ -22,7 +22,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
+import tempfile
 
 import pandas as pd
 
@@ -36,6 +37,18 @@ SCORE_FORMULA = "((element_count - unexpected_count) / element_count) * 100"
 # Sentinela para endpoints nulos em validações referenciais: o valor original é
 # preservado em record_value e a sentinela faz a Expectation de conjunto falhar.
 MISSING_REFERENCE = "__REFERENCIA_AUSENTE__"
+
+# Endereço web: esquema (http/https/ftp, em maiúscula ou minúscula) opcional + domínio com
+# ponto (ou IPv4) + porta, caminho, query e fragmento opcionais. Aceita "www.site.com",
+# "linktr.ee/nome", "Https://x.br" e domínio com ponto final ("x.br."). Rejeita espaços,
+# texto sem ponto ("sem site"), "www..x.br" e números soltos ("10.5").
+# Campos com vários endereços separados por '|' devem ser divididos antes (split_tokens).
+URL_REGEX = (r"(?i)^(?:(?:https?|ftps?)://)?"
+             r"(?:(?:[^\s./:?#@]+\.)+[A-Za-z][^\s./:?#@]+\.?|[0-9]{1,3}(?:\.[0-9]{1,3}){3})"
+             r"(?::[0-9]{1,5})?(?:[/?#][^\s]*)?$")
+
+# Telefone brasileiro: (xx) xxxx-xxxx ou (xx) 9xxxx-xxxx; o hífen é opcional.
+PHONE_REGEX = r"^\([0-9]{2}\) ?(?:[0-9]{4}|9[0-9]{4})-?[0-9]{4}$"
 
 ERROR_FIELDS = [
     "rule_id", "validation", "dimension", "entity", "column", "ref",
@@ -79,6 +92,111 @@ def get_columns(con, entity: str) -> list[str]:
 
 
 # ------------------------------------------------------------ serialização --
+class ErrorSpool:
+    """Coleção de erros em disco; mantém em RAM apenas a contagem.
+
+    Cada ocorrência é gravada em JSON Lines. A coleção pode ser percorrida mais
+    de uma vez sem carregar todos os registros na memória.
+    """
+    def __init__(self, prefix: str = "dq-errors") -> None:
+        temp_dir = RESULTS_DIR / ".tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix=f"{prefix}-", suffix=".jsonl", dir=temp_dir)
+        self.path = Path(name)
+        self._writer = os.fdopen(fd, "w", encoding="utf-8")
+        self.count = 0
+        self._cleaned = False
+
+    def append(self, row: dict[str, Any]) -> None:
+        if self._cleaned:
+            raise RuntimeError("A coleção temporária de erros já foi encerrada.")
+        self._writer.write(json.dumps(_plain(row), ensure_ascii=False, separators=(",", ":")))
+        self._writer.write("\n")
+        self.count += 1
+
+    def extend(self, rows: Iterable[dict[str, Any]]) -> None:
+        for row in rows:
+            self.append(row)
+
+    def __len__(self) -> int:
+        return self.count
+
+    def checkpoint(self) -> tuple[int, int]:
+        """Marca a posição atual para desfazer uma regra que falhou tecnicamente."""
+        if self._cleaned:
+            raise RuntimeError("A coleção temporária de erros já foi encerrada.")
+        self._writer.flush()
+        return self._writer.tell(), self.count
+
+    def rollback(self, checkpoint: tuple[int, int]) -> None:
+        """Remove somente o que foi gravado depois de um checkpoint."""
+        if self._cleaned:
+            raise RuntimeError("A coleção temporária de erros já foi encerrada.")
+        position, count = checkpoint
+        self._writer.seek(position)
+        self._writer.truncate()
+        self.count = count
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        if self._cleaned:
+            raise RuntimeError("A coleção temporária de erros já foi encerrada.")
+        self._writer.flush()
+        with self.path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                if line.strip():
+                    yield json.loads(line)
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        try:
+            self._writer.close()
+        finally:
+            self.path.unlink(missing_ok=True)
+            self._cleaned = True
+
+    def __del__(self) -> None:
+        # Fallback para erros inesperados antes da persistência final.
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+
+def _json_chunks(value: Any) -> Iterator[str]:
+    """Serializa estruturas aninhadas sem materializar coleções grandes."""
+    if isinstance(value, ErrorSpool) or (
+        hasattr(value, "__next__") and not isinstance(value, (str, bytes, dict))
+    ):
+        yield "["
+        first = True
+        for item in value:
+            if not first:
+                yield ","
+            first = False
+            yield from _json_chunks(item)
+        yield "]"
+    elif isinstance(value, dict):
+        yield "{"
+        first = True
+        for key, item in value.items():
+            if not first:
+                yield ","
+            first = False
+            yield json.dumps(str(key), ensure_ascii=False)
+            yield ":"
+            yield from _json_chunks(item)
+        yield "}"
+    elif isinstance(value, (list, tuple)):
+        yield "["
+        for index, item in enumerate(value):
+            if index:
+                yield ","
+            yield from _json_chunks(item)
+        yield "]"
+    else:
+        yield json.dumps(_plain(value), ensure_ascii=False, separators=(",", ":"))
+
 def _plain(value: Any) -> Any:
     if value is None:
         return None
@@ -101,16 +219,20 @@ def _plain(value: Any) -> Any:
 
 
 def write_json(path: Path, data: Any) -> None:
+    """Grava JSON em fluxo, inclusive quando há milhões de ocorrências."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_plain(data), ensure_ascii=False, indent=2), encoding="utf-8")
+    with path.open("w", encoding="utf-8") as stream:
+        for chunk in _json_chunks(data):
+            stream.write(chunk)
 
 
-def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
+def write_csv(path: Path, rows: Iterable[dict[str, Any]], fields: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows([{k: _plain(row.get(k)) for k in fields} for row in rows])
+        for row in rows:
+            writer.writerow({k: _plain(row.get(k)) for k in fields})
 
 
 # ------------------------------------------------- declaração e preparação --
@@ -130,7 +252,46 @@ class Rule:
     reason: str
     expectation: Any
     data: Any
-    batch_data: Any = None
+
+
+def make_rule(rule_id: str, dimension: str, validation: str, column: str,
+              description: str, reason: str, expectation: Any, data: Any) -> Rule:
+    """Atalho para criar uma Rule (usado por todas as classes)."""
+    return Rule(id=rule_id, dimension=dimension, validation=validation, column=column,
+                description=description, reason=reason, expectation=expectation, data=data)
+
+
+def make_broken_rule(rule_id: str, dimension: str, validation: str, column: str,
+                     description: str, problem: str) -> Rule:
+    """Regra impossível de executar (ex.: coluna ausente): vira ERRO TÉCNICO explícito."""
+    def _raise():
+        raise ValueError(problem)
+    return Rule(id=rule_id, dimension=dimension, validation=validation, column=column,
+                description=description, reason=problem, expectation=None, data=_raise)
+
+
+def make_check_rule(rule_id: str, dimension: str, validation: str, column: str,
+                    description: str, reason: str, rows_fn, predicate) -> Rule:
+    """Regra cujo critério é uma função (dígito verificador, data, md5...).
+
+    `rows_fn` devolve as linhas (coluna `value` = texto avaliado). `predicate(texto)` diz se o
+    valor é válido; é aplicada só aos valores distintos. A Expectation do GX (conjunto de
+    valores válidos) decide quais linhas falham, e os exemplos mostram o valor original.
+    """
+    import great_expectations.expectations as gxe
+    rule = Rule(id=rule_id, dimension=dimension, validation=validation, column=column,
+                description=description, reason=reason,
+                expectation=gxe.ExpectColumnValuesToBeInSet(column="value", value_set=set()),
+                data=None)
+
+    def data():
+        rows = rows_fn()
+        valid = {v for v in rows["value"].dropna().unique() if predicate(v)}
+        rule.expectation = gxe.ExpectColumnValuesToBeInSet(column="value", value_set=valid)
+        return rows
+
+    rule.data = data
+    return rule
 
 
 def normalize_text(value: Any) -> str | None:
@@ -180,35 +341,10 @@ def split_tokens(df: pd.DataFrame, column: str, separator: str = "|") -> pd.Data
     return pd.DataFrame(rows, columns=["__dq_row_id", "ref", "source", "record_value", "value"])
 
 
-def relation_rows(relations: pd.DataFrame, side: str) -> pd.DataFrame:
-    """Frame para validar se o endpoint `side` das relações pertence a um conjunto válido.
-
-    Endpoint nulo vira a sentinela MISSING_REFERENCE para a Expectation de
-    conjunto falhar; o valor original permanece em record_value e nos endpoints.
-    """
-    columns = ["__dq_row_id", "ref", "source", "value", "record_value",
-               "relation_type", "fromEntityRef", "toEntityRef", "info"]
-    if relations.empty:
-        return pd.DataFrame(columns=columns)
-    rows = pd.DataFrame({
-        "__dq_row_id": range(len(relations)),
-        "ref": relations[side],
-        "source": relations["source"] if "source" in relations.columns else None,
-        "record_value": relations[side],
-        "relation_type": relations["type"],
-        "fromEntityRef": relations["fromEntityRef"] if "fromEntityRef" in relations.columns else None,
-        "toEntityRef": relations["toEntityRef"] if "toEntityRef" in relations.columns else None,
-        "info": relations["info"] if "info" in relations.columns else None,
-    })
-    normalized = rows["record_value"].map(normalize_text)
-    rows["value"] = normalized.where(normalized.notna(), MISSING_REFERENCE)
-    return rows
-
-
 # ------------------------------------------------------------------ engine --
 def run_quality_checks(entity: str, rules: list[Rule], *,
                        extra_metadata: dict[str, Any] | None = None
-                       ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+                       ) -> tuple[list[dict[str, Any]], ErrorSpool, dict[str, Any]]:
     """Executa todas as regras de uma entidade com um único contexto GX efêmero.
 
     Regra que quebra por incompatibilidade de schema, configuração ou API vira
@@ -220,21 +356,18 @@ def run_quality_checks(entity: str, rules: list[Rule], *,
     context = gx.get_context(mode="ephemeral")
     datasource = context.data_sources.add_pandas(name="brcris_quality")
 
-    scores, errors, audits = [], [], []
+    scores, audits = [], []
+    errors = ErrorSpool(prefix=f"{entity}-errors")
     for rule_index, rule in enumerate(rules, start=1):
         rule_started = time.perf_counter()
+        error_checkpoint = errors.checkpoint()
         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{entity}] regra {rule_index}/{len(rules)}: {rule.id} — iniciando", flush=True)
         try:
-            if rule.batch_data is not None:
-                score, rule_errors, audit = run_batched_expectation(
-                    datasource, rule.batch_data(), rule, entity=entity,
-                )
-            else:
-                frame = rule.data() if callable(rule.data) else rule.data
-                score, rule_errors, audit = run_expectation(
-                    datasource, frame, rule, entity=entity,
-                )
+            frame = rule.data() if callable(rule.data) else rule.data
+            score, rule_errors, audit = run_expectation(datasource, frame, rule, entity=entity)
         except Exception as exc:
+            # Descarta ocorrências parciais para não divergir do score ERRO TÉCNICO.
+            errors.rollback(error_checkpoint)
             score = score_record(rule.id, rule.validation, rule.dimension, rule.column,
                                  rule.description, 0, 0,
                                  technical_error=f"{type(exc).__name__}: {exc}")
@@ -242,7 +375,10 @@ def run_quality_checks(entity: str, rules: list[Rule], *,
             audit = {"rule_id": rule.id, "expectation": type(rule.expectation).__name__,
                      "technical_error": f"{type(exc).__name__}: {exc}"}
         scores.append(score)
-        errors.extend(rule_errors)
+        if rule_errors is not None:
+            errors.extend(rule_errors)
+            if isinstance(rule_errors, ErrorSpool):
+                rule_errors.cleanup()
         audits.append(audit)
         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{entity}] regra {rule.id} finalizada em {time.perf_counter() - rule_started:.1f}s; avaliados={score.get('evaluated', 0):,}; falhas={score.get('failures', 0):,}; status={score.get('status')}", flush=True)
 
@@ -256,47 +392,6 @@ def run_quality_checks(entity: str, rules: list[Rule], *,
         **(extra_metadata or {}),
     }
     return scores, errors, metadata
-
-
-def run_batched_expectation(datasource, batches, rule: Rule, *, entity: str
-                            ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-    """Valida blocos de uma regra e agrega seus resultados em um único score."""
-    started = time.perf_counter()
-    element_count = 0
-    unexpected_count = 0
-    batch_count = 0
-    errors: list[dict[str, Any]] = []
-
-    for batch_count, dataframe in enumerate(batches, start=1):
-        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{entity}] {rule.id}: iniciando lote {batch_count:,} ({len(dataframe):,} registros)", flush=True)
-        batch_started = time.perf_counter()
-        score, batch_errors, _ = run_expectation(
-            datasource, dataframe, rule, entity=entity,
-            asset_suffix=f"batch_{batch_count:05d}",
-        )
-        element_count += score["evaluated"]
-        unexpected_count += score["failures"]
-        errors.extend(batch_errors)
-        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{entity}] {rule.id}: lote {batch_count:,} concluído em {time.perf_counter() - batch_started:.1f}s; acumulado={element_count:,}; falhas={unexpected_count:,}", flush=True)
-        # Solta referências temporárias antes de carregar o próximo bloco.
-        del dataframe, batch_errors, score
-        gc.collect()
-
-    score = score_record(
-        rule.id, rule.validation, rule.dimension, rule.column, rule.description,
-        element_count, unexpected_count, time.perf_counter() - started,
-    )
-    audit = {
-        "rule_id": rule.id,
-        "expectation": type(rule.expectation).__name__,
-        "success": unexpected_count == 0,
-        "element_count": element_count,
-        "unexpected_count": unexpected_count,
-        "result_format": "COMPLETE",
-        "batch_count": batch_count,
-        "batched": True,
-    }
-    return score, errors, audit
 
 
 def run_expectation(datasource, dataframe: pd.DataFrame, rule: Rule, *,
@@ -442,7 +537,7 @@ def average_scores(scores: list[dict[str, Any]]) -> tuple[float | None, list[dic
 
 
 # ------------------------------------------------------------- persistência --
-def save_validation_results(entity: str, scores: list[dict[str, Any]], errors: list[dict[str, Any]],
+def save_validation_results(entity: str, scores: list[dict[str, Any]], errors: Iterable[dict[str, Any]],
                             metadata: dict[str, Any]) -> dict[str, Path]:
     out = RESULTS_DIR / entity
     out.mkdir(parents=True, exist_ok=True)
@@ -465,6 +560,9 @@ def save_validation_results(entity: str, scores: list[dict[str, Any]], errors: l
     summary = {
         "entity": entity, "generated_at": datetime.now().isoformat(timespec="seconds"),
         "record_count": metadata.get("record_count"), "entity_score_pct": entity_score,
+        "sample_size": metadata.get("sample_size"),
+        "sampled_records": metadata.get("sampled_records"),
+        "sample_sizes_by_group": metadata.get("sample_sizes_by_group"),
         "dimension_scores": dimension_scores, "rules_count": len(scores),
         "rules_without_score": len(scores) - len(valid_rules),
         "technical_errors": sum(1 for s in scores if s.get("status") == "ERRO TÉCNICO"),
@@ -476,6 +574,8 @@ def save_validation_results(entity: str, scores: list[dict[str, Any]], errors: l
     paths["report_html"] = build_validation_report(entity, scores, errors, summary)
     if entity == "person":
         _remove_empty_legacy_person_dirs()
+    if isinstance(errors, ErrorSpool):
+        errors.cleanup()
     return paths
 
 
@@ -499,7 +599,7 @@ def _example_text(error: dict[str, Any]) -> str:
     return str(error.get("ref") or error.get("reason") or "(vazio)")
 
 
-def build_validation_report(entity: str, scores: list[dict[str, Any]], errors: list[dict[str, Any]], summary: dict[str, Any]) -> Path:
+def build_validation_report(entity: str, scores: list[dict[str, Any]], errors: Iterable[dict[str, Any]], summary: dict[str, Any]) -> Path:
     """Gera relatório HTML simples, com score por regra/dimensão/entidade e exemplos."""
     entity_score = summary.get("entity_score_pct")
     entity_text = "N/D" if entity_score is None else f"{entity_score:.2f}%"
@@ -509,13 +609,25 @@ def build_validation_report(entity: str, scores: list[dict[str, Any]], errors: l
     ) or "<tr><td colspan='3'>Sem scores disponíveis</td></tr>"
 
     error_by_rule: dict[str, list[dict[str, Any]]] = {}
-    for error in errors:
-        error_by_rule.setdefault(error["rule_id"], []).append(error)
+    examples_needed = {
+        score["rule_id"]: min(5, max(0, int(score.get("failures", 0) or 0)))
+        for score in scores
+    }
+    remaining_examples = sum(examples_needed.values())
+    if remaining_examples:
+        for error in errors:
+            rule_id = error["rule_id"]
+            examples = error_by_rule.setdefault(rule_id, [])
+            if len(examples) < examples_needed.get(rule_id, 0):
+                examples.append(error)
+                remaining_examples -= 1
+                if remaining_examples == 0:
+                    break
 
     rule_rows = []
     for score in scores:
-        # O HTML mostra no máximo 5 exemplos; os arquivos CSV/JSON têm todos.
-        examples = error_by_rule.get(score["rule_id"], [])[:5]
+        # O HTML mostra no máximo 5 exemplos; CSV/JSON mantêm todas as ocorrências.
+        examples = error_by_rule.get(score["rule_id"], [])
         example_html = "<br>".join(html.escape(_example_text(e)) for e in examples)
         if score.get("technical_error"):
             example_html = f"<span class='err'>{html.escape(score['technical_error'])}</span>"
@@ -532,8 +644,26 @@ def build_validation_report(entity: str, scores: list[dict[str, Any]], errors: l
         ]
         rule_rows.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
 
+    notes = []
     without_score = summary.get("rules_without_score", 0)
-    note = f" {without_score} regra(s) sem avaliação (SEM DADOS ou ERRO TÉCNICO) ficaram fora da média." if without_score else ""
+    if without_score:
+        notes.append(f"{without_score} regra(s) sem avaliação (SEM DADOS ou ERRO TÉCNICO) ficaram fora da média.")
+    if summary.get("partial_report"):
+        missing_groups = ", ".join(summary.get("groups_missing", []))
+        notes.append(f"Relatório parcial; grupos ainda não executados: {missing_groups}.")
+    sample_sizes_by_group = summary.get("sample_sizes_by_group")
+    if sample_sizes_by_group:
+        group_scopes = [
+            f"{group}: amostra de até {size:,}" if size is not None else f"{group}: base completa"
+            for group, size in sorted(sample_sizes_by_group.items())
+        ]
+        notes.append("Amostragem por grupo: " + "; ".join(group_scopes) + ".")
+    elif summary.get("sample_size") is not None:
+        notes.append(
+            f"Validação em amostra repetível de até {summary['sample_size']:,} registros."
+        )
+    note = " " + " ".join(notes) if notes else ""
+    errors_note = summary.get("errors_note", "Todas as ocorrências estão nos arquivos errors.csv e errors.json.")
     page = f"""<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Qualidade — {html.escape(entity)}</title><style>
 body{{font-family:Arial,sans-serif;max-width:1200px;margin:32px auto;padding:0 18px;color:#202938}}table{{border-collapse:collapse;width:100%;margin:16px 0}}th,td{{border-bottom:1px solid #ddd;padding:9px;text-align:left;vertical-align:top}}th{{background:#f1f4f8}}.score{{font-size:2rem;font-weight:bold}}.muted{{color:#687386}}.err{{color:#b3261e}}
@@ -542,7 +672,7 @@ body{{font-family:Arial,sans-serif;max-width:1200px;margin:32px auto;padding:0 1
 <h2>Score da entidade</h2><div class='score'>{entity_text}</div>
 <h2>Score por dimensão</h2><table><thead><tr><th>Dimensão</th><th>Score médio</th><th>Regras na média</th></tr></thead><tbody>{dim_rows}</tbody></table>
 <h2>Detalhes por validação</h2><table><thead><tr><th>Regra</th><th>Dimensão</th><th>Descrição</th><th>Score</th><th>Avaliados</th><th>Falhas</th><th>Status</th><th>Exemplos (máx. 5)</th></tr></thead><tbody>{''.join(rule_rows)}</tbody></table>
-<p class='muted'>Todas as ocorrências estão nos arquivos errors.csv e errors.json.</p></body></html>"""
+<p class='muted'>{html.escape(errors_note)}</p></body></html>"""
     path = REPORTS_DIR / entity / "report.html"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(page, encoding="utf-8")
