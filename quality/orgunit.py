@@ -54,6 +54,9 @@ def _build_rules(con, columns: list[str], orgunits: pd.DataFrame) -> list[common
     rules: list[common.Rule] = []
     identifier_columns = [c for c in columns if c.startswith("identifier.")]
 
+    # Singularidade (antes da unicidade): um único valor por identificador em cada registro.
+    common.add_singularity_rules(rules, "ORG-SIN-ID", orgunits, identifier_columns)
+
     # 1. Unicidade de todos os identificadores; valores com '|' são avaliados item a item.
     for number, column in enumerate(identifier_columns, start=1):
         rules.append(_base_rule(
@@ -137,8 +140,8 @@ def _build_rules(con, columns: list[str], orgunits: pd.DataFrame) -> list[common
          "websiteUrl deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).",
          "O valor de websiteUrl não corresponde ao formato de endereço web (domínio com ponto, sem espaços)."),
         ("phone", PHONE_REGEX, "ORG-VAL-PHONE",
-         "Para country = 'Brasil', phone deve seguir o formato (xx) xxxx-xxxx ou (xx) 9xxxx-xxxx.",
-         "O telefone de uma organização no Brasil não segue o formato (xx) xxxx-xxxx ou (xx) 9xxxx-xxxx."),
+         f"Para country = 'Brasil', phone deve seguir o formato {common.PHONE_TEXT}.",
+         "O telefone de uma organização no Brasil não segue o formato de telefone aceito."),
     ]
     for column, regex, rule_id, description, reason in format_rules:
         if column not in columns:

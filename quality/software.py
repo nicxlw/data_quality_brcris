@@ -63,6 +63,8 @@ def _build_rules(con, columns: list[str], software: pd.DataFrame) -> list[common
 
     # Unicidade de todos os identificadores, incluindo identificadores multivalorados.
     identifier_columns = [column for column in columns if column.startswith("identifier.")]
+    # Singularidade (antes da unicidade): um único valor por identificador em cada registro.
+    common.add_singularity_rules(rules, "SFT-SIN-ID", software, identifier_columns)
     for number, column in enumerate(identifier_columns, start=1):
         rules.append(_rule(
             f"SFT-UNI-ID-{number:02d}", "unicidade", "unicidade", column,

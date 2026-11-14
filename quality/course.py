@@ -73,6 +73,9 @@ def _build_rules(columns: list[str], courses: pd.DataFrame) -> list[common.Rule]
         column for column in columns if column.startswith("identifier.")
     ]
 
+    # Singularidade (antes da unicidade): um único valor por identificador em cada registro.
+    common.add_singularity_rules(rules, "CRS-SIN-ID", courses, identifier_columns)
+
     for number, column in enumerate(identifier_columns, start=1):
         rules.append(_rule(
             f"CRS-UNI-ID-{number:02d}", "unicidade", "unicidade", column,

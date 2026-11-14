@@ -145,25 +145,26 @@ def _col(columns, name, alias=""):
     return f"{alias}{ident(name)}" if name in columns else "NULL"
 
 
-BOOK_FILTER = ("strip_accents(lower(trim(CAST(s.\"type\" AS VARCHAR)))) NOT IN ({types}) "
-               "OR s.\"type\" IS NULL")
-
-
-def _plan_unique(eng, meta, column, split, skip_books=False):
+def _plan_singular(eng, meta, columns, column):
+    """Singularidade: o campo não pode conter '|' (mais de um valor no mesmo registro)."""
     c = ident(column)
-    book = ""
-    if skip_books:
-        from quality import publication as pub
-        types = ", ".join(q(t) for t in pub.BOOK_TYPES)
-        book = " AND (" + BOOK_FILTER.format(types=types) + ")"
+    nonempty = f"{c} IS NOT NULL AND trim(CAST({c} AS VARCHAR)) <> ''"
+    bad = (select_errors(eng.entity, meta, ref=_col(columns, "ref"), source=_col(columns, "source"),
+                         value=f"trim(CAST({c} AS VARCHAR))", record_value=c)
+           + f" FROM {eng.src} WHERE {nonempty} AND position('|' IN CAST({c} AS VARCHAR)) > 0")
+    return f"SELECT count(*) FROM {eng.src} WHERE {nonempty}", bad
+
+
+def _plan_unique(eng, meta, column, split):
+    c = ident(column)
     if split:
         base = (f'SELECT s."ref" AS r, s."source" AS sc, CAST(s.{c} AS VARCHAR) AS rv, trim(tok.value) AS v '
                 f"FROM {eng.src} AS s, UNNEST(string_split(CAST(s.{c} AS VARCHAR), '|')) AS tok(value) "
-                f"WHERE s.{c} IS NOT NULL AND trim(tok.value) <> ''{book}")
+                f"WHERE s.{c} IS NOT NULL AND trim(tok.value) <> ''")
     else:
         base = (f'SELECT s."ref" AS r, s."source" AS sc, CAST(s.{c} AS VARCHAR) AS rv, '
                 f"trim(CAST(s.{c} AS VARCHAR)) AS v FROM {eng.src} AS s "
-                f"WHERE s.{c} IS NOT NULL AND trim(CAST(s.{c} AS VARCHAR)) <> ''{book}")
+                f"WHERE s.{c} IS NOT NULL AND trim(CAST(s.{c} AS VARCHAR)) <> ''")
     bad = (f"WITH t AS ({base}), d AS (SELECT v FROM t GROUP BY v HAVING count(*) > 1) "
            + select_errors(eng.entity, meta, ref="t.r", source="t.sc", value="t.v", record_value="t.rv")
            + " FROM t JOIN d USING (v)")
@@ -307,8 +308,10 @@ def validate_publication(sample_size=None, memory_limit=None):
             if rule.problem:                  # coluna ausente: vira ERRO TÉCNICO com a explicação
                 raise ValueError(rule.problem)
             rid, col = rule.id, rule.column
+            if rid.startswith("PUB-SIN-ID-"):
+                return _plan_singular(eng, meta, columns, col)
             if rid.startswith("PUB-UNI-ID-"):
-                return _plan_unique(eng, meta, col, split=True, skip_books=col in pub.UNIQUE_SKIP_BOOK_TYPES)
+                return _plan_unique(eng, meta, col, split=True)
             if rid == "PUB-VAL-PAGES-ORDER":
                 return _plan_pages_order(eng, meta, columns)
             if rid == "PUB-VAL-DOI":

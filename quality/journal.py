@@ -69,6 +69,9 @@ def _build_rules(con, columns: list[str], journals: pd.DataFrame) -> list[common
     rules: list[common.Rule] = []
     identifier_columns = [c for c in columns if c.startswith("identifier.")]
 
+    # Singularidade (antes da unicidade): um único valor por identificador em cada registro.
+    common.add_singularity_rules(rules, "JOU-SIN-ID", journals, identifier_columns)
+
     # 1. Unicidade de cada coluna identifier.*; valores separados por '|' são avaliados individualmente.
     for number, column in enumerate(identifier_columns, start=1):
         rules.append(_base_rule(
@@ -141,16 +144,6 @@ def _build_rules(con, columns: list[str], journals: pd.DataFrame) -> list[common
             f"O dígito verificador de {column} não confere.",
             lambda column=column: _issn_format_ok(journals, column),
             checks.issn,
-        ))
-
-    # 4c. brcris do periódico é o MD5 do ISSN (um hash por ISSN, na mesma linha).
-    if {"identifier.issn", "identifier.brcris"}.issubset(columns):
-        rules.append(common.make_check_rule(
-            "JOU-CON-BRCRIS-ISSN", "consistência", "consistência entre campos", "identifier.brcris",
-            "identifier.brcris deve ser o MD5 do identifier.issn (um hash por ISSN).",
-            "identifier.brcris não corresponde ao MD5 do identifier.issn do mesmo registro.",
-            lambda: _issn_brcris_pairs(journals),
-            _brcris_matches_issn,
         ))
 
     # 5. websiteURL deve ser um endereço web válido; valores ausentes são ignorados aqui.
@@ -228,10 +221,10 @@ def _build_rules(con, columns: list[str], journals: pd.DataFrame) -> list[common
     if "apcCost.apcCurrency" in columns:
         rules.append(_base_rule(
             "JOU-VAL-APC-CURRENCY", "validade", "formato", "apcCost.apcCurrency",
-            "apcCost.apcCurrency, quando preenchido, deve ser um código de moeda de 3 letras maiúsculas (ex.: USD).",
+            "apcCost.apcCurrency, quando preenchido, deve ser um código de moeda de 3 letras maiúsculas (ex.: USD); com vários valores separados por '|', cada um é avaliado.",
             "O valor de apcCost.apcCurrency não é um código de moeda de 3 letras maiúsculas.",
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=CURRENCY_REGEX),
-            lambda: _non_null_base_rows(journals, "apcCost.apcCurrency"),
+            lambda: common.split_tokens(journals, "apcCost.apcCurrency"),
         ))
     for column, rule_id in [("h_index", "JOU-VAL-H-INDEX"), ("i10_index", "JOU-VAL-I10-INDEX")]:
         if column not in columns:
@@ -251,27 +244,6 @@ def _issn_format_ok(journals: pd.DataFrame, column: str) -> pd.DataFrame:
     """ISSN já no formato XXXX-XXXX; só eles passam pela checagem do dígito verificador."""
     rows = common.split_tokens(journals, column)
     return rows.loc[rows["value"].str.fullmatch(ISSN_REGEX, na=False)].reset_index(drop=True)
-
-
-def _issn_brcris_pairs(journals: pd.DataFrame) -> pd.DataFrame:
-    """Uma linha por registro com ISSN e brcris preenchidos: value = 'issn / brcris'."""
-    frame = journals[["ref", "source", "identifier.issn", "identifier.brcris"]].copy()
-    issn = frame["identifier.issn"].map(common.normalize_text)
-    brcris = frame["identifier.brcris"].map(common.normalize_text)
-    keep = issn.notna() & brcris.notna()
-    frame = frame.loc[keep].copy()
-    frame["record_value"] = issn[keep] + " / " + brcris[keep]
-    frame["value"] = frame["record_value"]
-    frame = frame[["ref", "source", "record_value", "value"]].reset_index(drop=True)
-    frame.insert(0, "__dq_row_id", range(len(frame)))
-    return frame
-
-
-def _brcris_matches_issn(pair: str) -> bool:
-    issn, _, brcris = pair.partition(" / ")
-    expected = {checks.md5_hex(item.strip()) for item in issn.split("|") if item.strip()}
-    found = {item.strip().lower() for item in brcris.split("|") if item.strip()}
-    return expected == found
 
 
 def _non_negative_number(value) -> bool:

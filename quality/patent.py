@@ -13,13 +13,12 @@ URL_REGEX = common.URL_REGEX
 KIND_CODE_REGEX = r"^[A-Z][0-9]?$"                 # A, B1, C1, U2...
 COUNTRY_CODE_REGEX = r"^[A-Z]{2}$"                 # BR, US, WO...
 IPC_SECTION_REGEX = r"^[A-H]$"                     # seções IPC: A a H
-IPC_TEXT_REGEX = r"^[A-H][0-9]{2}[A-Z] ?[0-9]{1,4}/[0-9]{2,}$"   # ex.: A61K 31/00
 
 def _load_patents(con, columns: list[str]) -> pd.DataFrame:
     wanted = [
         "ref", "source", "identifier.espacenet", "title", "inventor",
         "resourceUrl", "depositDate", "publicationDate", "kindCode", "countryCode",
-        "classification.ipc.section", "classification.ipc.text",
+        "classification.ipc.section",
     ] + [c for c in columns if c.startswith("identifier.")]
     selected = [c for c in dict.fromkeys(wanted) if c in columns]
     if not selected:
@@ -40,6 +39,9 @@ def _non_null_rows(patents: pd.DataFrame, column: str) -> pd.DataFrame:
 def _build_rules(con, columns: list[str], patents: pd.DataFrame) -> list[common.Rule]:
     rules: list[common.Rule] = []
     identifier_columns = [c for c in columns if c.startswith("identifier.")]
+
+    # Singularidade (antes da unicidade): um único valor por identificador em cada registro.
+    common.add_singularity_rules(rules, "PAT-SIN-ID", patents, identifier_columns)
 
     for number, column in enumerate(identifier_columns, start=1):
         rules.append(_rule(
@@ -107,9 +109,6 @@ def _build_rules(con, columns: list[str], patents: pd.DataFrame) -> list[common.
         ("classification.ipc.section", IPC_SECTION_REGEX, "PAT-VAL-IPC-SECTION",
          "Cada seção IPC deve ser uma letra de A a H.",
          "A seção IPC não é uma letra de A a H."),
-        ("classification.ipc.text", IPC_TEXT_REGEX, "PAT-VAL-IPC-TEXT",
-         "Cada classificação IPC completa deve ter o formato seção+classe+subclasse grupo/subgrupo (ex.: A61K 31/00).",
-         "A classificação IPC não tem o formato A61K 31/00."),
     ]:
         if column not in columns:
             continue

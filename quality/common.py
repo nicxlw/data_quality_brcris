@@ -47,8 +47,10 @@ URL_REGEX = (r"(?i)^(?:(?:https?|ftps?)://)?"
              r"(?:(?:[^\s./:?#@]+\.)+[A-Za-z][^\s./:?#@]+\.?|[0-9]{1,3}(?:\.[0-9]{1,3}){3})"
              r"(?::[0-9]{1,5})?(?:[/?#][^\s]*)?$")
 
-# Telefone brasileiro: (xx) xxxx-xxxx ou (xx) 9xxxx-xxxx; o hífen é opcional.
-PHONE_REGEX = r"^\([0-9]{2}\) ?(?:[0-9]{4}|9[0-9]{4})-?[0-9]{4}$"
+# Telefone brasileiro: (xx) xxxx-xxxx ou (xx) 9xxxx-xxxx. Aceita também DDD com 0 inicial
+# ("(041)"), número colado ("33505601") e espaço no lugar do hífen ("3764 5551").
+PHONE_REGEX = r"^\(0?[0-9]{2}\) ?(?:[0-9]{4}|9[0-9]{4})[ -]?[0-9]{4}$"
+PHONE_TEXT = "(xx) xxxx-xxxx ou (xx) 9xxxx-xxxx (DDD pode ter 0 inicial; hífen opcional ou trocado por espaço)"
 
 ERROR_FIELDS = [
     "rule_id", "validation", "dimension", "entity", "column", "ref",
@@ -292,6 +294,28 @@ def make_check_rule(rule_id: str, dimension: str, validation: str, column: str,
 
     rule.data = data
     return rule
+
+
+def add_singularity_rules(rules: list, id_prefix: str, frame: pd.DataFrame,
+                          identifier_columns: list[str]) -> None:
+    """Singularidade: cada coluna identifier.* deve ter um único valor por registro (sem '|').
+
+    Vem antes da unicidade. Não vale para title/name, que podem ter grafias diferentes.
+    A numeração acompanha a das regras de unicidade (…-SIN-01 ↔ …-UNI-01).
+    """
+    import great_expectations.expectations as gxe
+    for number, column in enumerate(identifier_columns, start=1):
+        rules.append(make_rule(
+            f"{id_prefix}-{number:02d}", "validade", "singularidade", column,
+            f"Cada registro deve ter um único valor em {column} (sem '|').",
+            f"{column} tem mais de um valor no mesmo registro.",
+            gxe.ExpectColumnValuesToNotMatchRegex(column="value", regex=r"\|"),
+            lambda column=column: _non_null(base_rows(frame, column)),
+        ))
+
+
+def _non_null(rows: pd.DataFrame) -> pd.DataFrame:
+    return rows[rows["value"].notna()].reset_index(drop=True)
 
 
 def normalize_text(value: Any) -> str | None:

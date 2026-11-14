@@ -10,10 +10,8 @@ MANDATORY_COLUMNS = ["ref", "name", "identifier.brcris", "identifier.capes"]
 PHONE_REGEX = common.PHONE_REGEX      # (xx) xxxx-xxxx ou (xx) 9xxxx-xxxx; hífen opcional
 EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 URL_REGEX = common.URL_REGEX
-AREA_COLUMNS = ["researchArea.capes", "researchArea.cnpq", "evaluationArea"]
 def _load_programs(con, columns: list[str]) -> pd.DataFrame:
-    wanted = ["ref", "source", "name", "identifier.brcris", "identifier.capes", "phone", "email", "websiteUrl", "websiteurl",
-              *AREA_COLUMNS]
+    wanted = ["ref", "source", "name", "identifier.brcris", "identifier.capes", "phone", "email", "websiteUrl", "websiteurl"]
     wanted += [c for c in columns if c.startswith("identifier.")]
     selected = [c for c in dict.fromkeys(wanted) if c in columns]
     if not selected:
@@ -31,18 +29,12 @@ def _non_null_rows(programs: pd.DataFrame, column: str) -> pd.DataFrame:
     return rows[rows["value"].notna()].reset_index(drop=True)
 
 
-def _not_all_caps(value) -> bool:
-    """Falso se algum nível (entre '/') tem mais de 3 letras e todas maiúsculas (siglas curtas passam)."""
-    for level in str(value).split("/"):
-        letters = [ch for ch in level if ch.isalpha()]
-        if len(letters) > 3 and all(ch.isupper() for ch in letters):
-            return False
-    return True
-
-
 def _build_rules(con, columns: list[str], programs: pd.DataFrame) -> list[common.Rule]:
     rules: list[common.Rule] = []
     identifier_columns = [c for c in columns if c.startswith("identifier.")]
+    # Singularidade (antes da unicidade): um único valor por identificador em cada registro.
+    common.add_singularity_rules(rules, "PRO-SIN-ID", programs, identifier_columns)
+
     for number, column in enumerate(identifier_columns, start=1):
         rules.append(_rule(
             f"PRO-UNI-ID-{number:02d}", "unicidade", "unicidade", column,
@@ -70,7 +62,7 @@ def _build_rules(con, columns: list[str], programs: pd.DataFrame) -> list[common
             "Cada programa deve ter uma referência ref única.", f"Coluna obrigatória 'ref' ausente na view {ENTITY!r}."))
 
     for column, rule_id, regex, description, reason in [
-        ("phone", "PRO-VAL-PHONE", PHONE_REGEX, "phone deve seguir o formato (xx) xxxx-xxxx ou (xx) 9xxxx-xxxx (o hífen é opcional).", "O telefone não corresponde a nenhum dos formatos aceitos."),
+        ("phone", "PRO-VAL-PHONE", PHONE_REGEX, f"phone deve seguir o formato {common.PHONE_TEXT}.", "O telefone não corresponde a nenhum dos formatos aceitos."),
         ("email", "PRO-VAL-EMAIL", EMAIL_REGEX, "email deve seguir um formato básico de endereço de e-mail.", "O valor de email não corresponde ao formato básico de e-mail."),
     ]:
         if column not in columns:
@@ -87,17 +79,6 @@ def _build_rules(con, columns: list[str], programs: pd.DataFrame) -> list[common
         rules.append(_rule("PRO-VAL-WEBSITE-URL", "validade", "formato", website_column,
             f"{website_column} deve conter um endereço web válido (com ou sem http/https, ex.: www.site.com).", "O valor não corresponde ao formato de endereço web (domínio com ponto, sem espaços).",
             gxe.ExpectColumnValuesToMatchRegex(column="value", regex=URL_REGEX), lambda: common.split_tokens(programs, website_column)))
-
-    # Áreas: o modelo pede capitalização correta (não tudo em maiúsculas), em cada nível da árvore.
-    for column in AREA_COLUMNS:
-        if column in columns:
-            rules.append(common.make_check_rule(
-                f"PRO-VAL-CAPS-{column.replace('.', '-').upper()}", "validade", "capitalização", column,
-                f"{column} deve estar com capitalização correta: nenhum nível da árvore (separado por '/') pode estar todo em maiúsculas.",
-                "Algum nível da área está todo em letras maiúsculas.",
-                lambda column=column: _non_null_rows(programs, column),
-                _not_all_caps,
-            ))
     return rules
 
 

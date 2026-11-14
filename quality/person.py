@@ -47,6 +47,9 @@ def _build_rules(con, columns: list[str], people: pd.DataFrame) -> list[common.R
     rules = []
     identifier_columns = [c for c in columns if c.startswith("identifier.")]
 
+    # Singularidade (antes da unicidade): um único valor por identificador em cada registro.
+    common.add_singularity_rules(rules, "PER-SIN", people, identifier_columns)
+
     # 1. Unicidade de cada identificador; valores concatenados são avaliados item a item.
     for number, column in enumerate(identifier_columns, start=1):
         rules.append(_base_rule(

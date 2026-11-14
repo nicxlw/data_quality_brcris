@@ -20,9 +20,6 @@ NUMBER_REGEX = r"^[+-]?(?:[0-9]+(?:[.,][0-9]*)?|[.,][0-9]+)(?:[eE][+-]?[0-9]+)?$
 CURRENT_YEAR = date.today().year
 MIN_YEAR = 1500                       # anos anteriores são tratados como erro de digitação
 DOI_REGEX = r"^10\.[0-9]{4,9}/[^\s]+$"
-# DOI e ISBN se repetem de forma legítima entre capítulos e o livro; a unicidade ignora esses tipos
-UNIQUE_SKIP_BOOK_TYPES = ("identifier.doi", "identifier.isbn")
-BOOK_TYPES = ("capitulo de livro", "livro")          # comparados sem acento e em minúsculas
 
 
 @dataclass
@@ -71,15 +68,15 @@ def build_rules(columns: list[str], sample_size: int | None = None) -> list[Rule
         rules.append(RuleDef(rule_id, dimension, validation, column, description,
                              missing or reason, problem=missing))
 
-    # Unicidade de cada coluna identifier.* (valores separados por '|')
+    # Singularidade (vem antes da unicidade): cada identifier.* deve ter um único valor por registro
     identifier_columns = [c for c in columns if c.startswith("identifier.")]
     for number, column in enumerate(identifier_columns, start=1):
-        if column in UNIQUE_SKIP_BOOK_TYPES:
-            add(f"PUB-UNI-ID-{number:02d}", "unicidade", "unicidade", column,
-                f"Cada valor de {column} deve ser único {scope}, exceto em publicações do tipo Capítulo de Livro ou Livro "
-                f"(que podem compartilhar o valor).", f"Valor de {column} duplicado entre publicações que não são capítulo nem livro.",
-                missing=None if "type" in columns else f"Coluna 'type' ausente na view {ENTITY!r}.")
-            continue
+        add(f"PUB-SIN-ID-{number:02d}", "validade", "singularidade", column,
+            f"Cada publicação deve ter um único valor em {column} (sem '|') {scope}.",
+            f"{column} tem mais de um valor no mesmo registro.")
+
+    # Unicidade de cada coluna identifier.* (valores separados por '|')
+    for number, column in enumerate(identifier_columns, start=1):
         add(f"PUB-UNI-ID-{number:02d}", "unicidade", "unicidade", column,
             f"Cada valor de {column} deve ser único {scope}.", f"Valor de {column} duplicado.")
 
