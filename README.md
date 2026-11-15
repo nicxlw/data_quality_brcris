@@ -43,7 +43,8 @@ A arquitetura separa:
 ```text
 tcc/
 ├── config/
-│   └── entities.yaml
+│   ├── entities.yaml
+│   └── exploration.yaml
 ├── data/
 │   ├── raw/
 │   ├── parquet/
@@ -51,8 +52,15 @@ tcc/
 │   │   └── relation/
 │   └── tcc.duckdb
 ├── quality/
+│   ├── autoridade/
+│   │   ├── dominios.json
+│   │   └── ... (listas de países, estados, municípios IBGE, idiomas, periódicos, Lattes, ORCID, orgunits)
+│   ├── authority.py
+│   ├── checks.py
 │   ├── common.py
+│   ├── course.py
 │   ├── exploration.py
+│   ├── fast.py
 │   ├── journal.py
 │   ├── orgunit.py
 │   ├── patent.py
@@ -67,7 +75,8 @@ tcc/
 ├── reports/
 │   └── <classe>/
 ├── extract.py
-└── run.py
+├── run.py
+└── validacoes_por_classe.md
 ```
 
 ### `config/entities.yaml`
@@ -92,7 +101,13 @@ Responsável por abrir os ZIPs, processar os XMLs em streaming, extrair os regis
 
 ### `quality/`
 
-Contém as regras de qualidade por entidade e a infraestrutura compartilhada em `common.py`. `exploration.py` gera análises descritivas das views.
+Contém as regras de qualidade por entidade e a infraestrutura compartilhada:
+
+- `common.py`: infraestrutura das regras (criação de `Rule`, regras de singularidade, execução no Great Expectations, scores e relatórios);
+- `checks.py`: funções de formato e dígito verificador (CPF, CNPJ, ISSN, ISBN, ORCID, ISNI...);
+- `authority.py` e `autoridade/`: validação contra listas de autoridade (países, estados, municípios IBGE, idiomas, periódicos, IDs Lattes, ORCIDs, orgunits) e os domínios fixos em `dominios.json` (tipo de publicação, tipo de acesso, grau e tipo de curso, tipo de software, Qualis);
+- `fast.py`: motor SQL (DuckDB) que executa `publication` e `relation`, que são grandes demais para o Pandas;
+- `exploration.py`: análises descritivas das views.
 
 ### `results/`
 
@@ -248,9 +263,34 @@ Isso também evita aumentar desnecessariamente o uso de armazenamento, algo rele
 
 # Regras de qualidade
 
-As regras são definidas em módulos próprios dentro de `quality/`, incluindo `journal`, `orgunit`, `patent`, `person`, `program`, `publication`, `relation`, `researchgroup` e `software`. Cada módulo (exceto `publication` e `relation`) expõe `validate()`, que devolve scores, ocorrências de erro e metadados; as Expectations do Great Expectations são executadas pelo mecanismo compartilhado em `quality/common.py`. `publication` e `relation` só definem as regras e são executadas em SQL por `quality/fast.py`.
+As regras são definidas em módulos próprios dentro de `quality/`, incluindo `course`, `journal`, `orgunit`, `patent`, `person`, `program`, `publication`, `relation`, `researchgroup` e `software`. Cada módulo (exceto `publication` e `relation`) expõe `validate()`, que devolve scores, ocorrências de erro e metadados; as Expectations do Great Expectations são executadas pelo mecanismo compartilhado em `quality/common.py`. `publication` e `relation` só definem as regras e são executadas em SQL por `quality/fast.py`.
 
-As regras incluem verificações de completude, unicidade, formato, domínio e consistência referencial, conforme a entidade. Consulte o módulo correspondente para ver as regras e seus identificadores atualizados.
+As regras incluem verificações de completude, unicidade, formato, domínio e consistência referencial, conforme a entidade. **A lista completa de regras de cada classe está em [`validacoes_por_classe.md`](validacoes_por_classe.md).** Consulte também o módulo correspondente.
+
+## Dimensões e identificadores das regras
+
+O id da regra segue `PREFIXO-DIMENSÃO-...` (por exemplo `PER-VAL-CPF`, `PUB-UNI-ID-02`):
+
+| Sigla | Dimensão | O que verifica |
+|---|---|---|
+| `SIN` | Singularidade | O campo tem um único valor por registro (sem `\|`) |
+| `UNI` | Unicidade | O valor não se repete em outros registros |
+| `COM` | Completude | O campo obrigatório está preenchido |
+| `VAL` | Validade | Formato, dígito verificador, intervalo ou data válidos |
+| `AUT` | Autoridade | O valor existe em uma lista de referência |
+| `CON` | Consistência | Coerência entre campos, entre registros ou entre classes (relation) |
+
+### Campos com vários valores (`|`)
+
+Quando um registro tem mais de um valor no mesmo campo, eles ficam concatenados com `|` (por exemplo, `identifier.doi = 10.1/a|10.1/b`). Por isso, para os identificadores, a **singularidade** roda antes da unicidade: ela aponta os registros com mais de um valor, e a unicidade testa cada valor separado, para que o `|` não esconda duplicatas.
+
+### Identificadores derivados
+
+Alguns identificadores `brcris` são um hash de outro campo, e isso é usado nas validações:
+
+- `person`: `identifier.brcris` = MD5 de `identifier.lattes` (regra `PER-CON-BRCRIS-LATTES`);
+- `orgunit`: nas relações, `brcris::<hash>` é o MD5 de `identifier.brcris` em minúsculas, então a comparação usa `md5(lower(identifier.brcris))`;
+- `journal`: `identifier.brcris` é o MD5 do ISSN.
 
 ## Validação de Publication
 
@@ -276,6 +316,18 @@ python run.py validate relation --sample-size 200000
 O prefixo do semanticIdentifier (`lattes::`, `brcris::`, `docdb::`...) indica a coluna `identifier.<prefixo>` do alvo (`docdb` usa `identifier.espacenet`). O valor é normalizado antes de comparar: remove-se `prefixo::` e espaços; em `docdb` também se ignoram código do país, código de tipo e símbolos. Os exemplos do relatório mostram o valor original. A lista de regras (`RELATION_ENDPOINTS`) fica em `quality/relation.py`.
 
 O banco é aberto só para leitura. Feche o DBeaver ou outros programas que usem o mesmo arquivo DuckDB antes de executar.
+
+Para `relation`, quando o destino é `orgunit` o `brcris::` é comparado como `md5(lower(identifier.brcris))` (`HASHED_BRCRIS_TARGETS` em `quality/relation.py`).
+
+## Banco alternativo (`TCC_DUCKDB_PATH`)
+
+Por padrão o projeto usa `data/tcc.duckdb`. Para apontar para outro arquivo DuckDB (por exemplo, um banco de teste), defina a variável de ambiente antes de rodar:
+
+```bash
+# Windows (PowerShell)
+$env:TCC_DUCKDB_PATH = "C:\caminho\teste.duckdb"
+python run.py validate person --skip-extract
+```
 
 # Executando o projeto
 
@@ -395,6 +447,10 @@ python run.py validate person --force-extract --workers 2
 ```
 
 Também é aceita a forma de compatibilidade `python run.py person --skip-extract`.
+
+# Análises em SQL (DBeaver)
+
+Os padrões de falha da publicação e das relações foram investigados com consultas SQL direto no `data/tcc.duckdb` (por exemplo, no DBeaver), com o banco aberto só para leitura. Como `publication` tem dezenas de milhões de linhas, as consultas mais pesadas (unicidade por grupo) usam uma amostra repetível: `hash(chave) % 20 = 0` mantém todos os registros de uma mesma chave (1/20 da base), e as contagens são multiplicadas por 20. Os resultados e as conclusões estão em `reports/relatorio_final_brcris.md`.
 
 # Análise exploratória
 

@@ -27,7 +27,6 @@ ISSN_REGEX = r"^[0-9]{4}-[0-9]{3}[0-9Xx]$"
 # URL: ver common.URL_REGEX (aceita www., linktree e outros endereços sem http).
 URL_REGEX = common.URL_REGEX
 BOOLEAN_VALUES = {"true", "false"}
-CURRENCY_REGEX = r"^[A-Z]{3}$"   # código de moeda ISO 4217 (3 letras maiúsculas)
 
 
 def _load_journals(con, columns: list[str]) -> pd.DataFrame:
@@ -35,7 +34,7 @@ def _load_journals(con, columns: list[str]) -> pd.DataFrame:
     wanted = [
         "ref", "source", "title", "identifier.openalex", "identifier.issn",
         "identifier.issn_l", "identifier.brcris", "websiteURL", "isOa",
-        "isInDoaj", "type", "countryCode", "apcCost.apcCurrency", "h_index", "i10_index", "qualis",
+        "isInDoaj", "type", "countryCode", "h_index", "i10_index", "qualis",
     ] + [c for c in columns if c.startswith("identifier.")]
     selected = [c for c in dict.fromkeys(wanted) if c in columns]
     if not selected:
@@ -217,15 +216,7 @@ def _build_rules(con, columns: list[str], journals: pd.DataFrame) -> list[common
         description="title deve corresponder a um nome da lista de periódicos de autoridade.",
     )
 
-    # 8. Moeda do APC (código de 3 letras) e índices numéricos não negativos.
-    if "apcCost.apcCurrency" in columns:
-        rules.append(_base_rule(
-            "JOU-VAL-APC-CURRENCY", "validade", "formato", "apcCost.apcCurrency",
-            "apcCost.apcCurrency, quando preenchido, deve ser um código de moeda de 3 letras maiúsculas (ex.: USD); com vários valores separados por '|', cada um é avaliado.",
-            "O valor de apcCost.apcCurrency não é um código de moeda de 3 letras maiúsculas.",
-            gxe.ExpectColumnValuesToMatchRegex(column="value", regex=CURRENCY_REGEX),
-            lambda: common.split_tokens(journals, "apcCost.apcCurrency"),
-        ))
+    # 8. Índices numéricos não negativos.
     for column, rule_id in [("h_index", "JOU-VAL-H-INDEX"), ("i10_index", "JOU-VAL-I10-INDEX")]:
         if column not in columns:
             continue
