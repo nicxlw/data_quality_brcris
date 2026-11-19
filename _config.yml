@@ -1,0 +1,15 @@
+title: Qualidade de Dados no BrCris
+description: Relatórios da avaliação da qualidade de dados da camada gold do BrCris (TCC, UFRJ)
+theme: jekyll-theme-cayman
+lang: pt-BR
+plugins:
+  - jekyll-optional-front-matter
+optional_front_matter:
+  remove_originals: false
+exclude:
+  - quality
+  - config
+  - extract.py
+  - run.py
+  - requirements.txt
+  - .gitignore
